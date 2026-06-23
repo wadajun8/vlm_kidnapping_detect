@@ -4,17 +4,24 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import rclpy
-from rclpy.node import Node
+from rclpy.node import Node 
 import numpy as np
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 
 class Superposition(Node):
     def __init__(self):
         super().__init__("superposition")
+
+        map_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE
+        )
         
-        self.map_sub = self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
+        self.map_sub = self.create_subscription(OccupancyGrid, '/map', self.map_callback, map_qos)
         self.image_pub = self.create_publisher(Image, '/vlm_context_image', 10)
 
         self.cv_bridge = CvBridge()
