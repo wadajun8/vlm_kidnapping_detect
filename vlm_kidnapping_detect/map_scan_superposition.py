@@ -7,6 +7,7 @@ import numpy as np
 import cv2
 import math
 from collections import deque
+from datetime import datetime
 from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.msg import ParticleCloud
 from sensor_msgs.msg import Image, LaserScan
@@ -15,6 +16,11 @@ from rclpy.qos import (
     QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy,
     qos_profile_sensor_data
 )
+
+try:
+    from vlm_kidnapping_detect.srv import SaveOverlayImage
+except ImportError:
+    SaveOverlayImage = None
 
 
 class Superposition(Node):
@@ -27,12 +33,16 @@ class Superposition(Node):
         self.declare_parameter('show_best_pose', True)        # 自己位置代表点(重み付き平均)を描画するか
         self.declare_parameter('best_pose_radius', 4)         # 代表点の基準半径[px]
         self.declare_parameter('laser_point_radius', 1)       # レーザー点群の半径[px]
+        self.declare_parameter('batch_window_seconds', 1.0)   # センサデータをまとめる時間窓[s]
+        self.declare_parameter('batch_history_count', 5)      # 何回分のバッチを重ねるか
 
         self.history_length = self.get_parameter('history_length').value
         self.publish_rate = self.get_parameter('publish_rate').value
         self.show_best_pose = self.get_parameter('show_best_pose').value
         self.best_pose_radius = self.get_parameter('best_pose_radius').value
         self.laser_point_radius = self.get_parameter('laser_point_radius').value
+        self.batch_window_seconds = self.get_parameter('batch_window_seconds').value
+        self.batch_history_count = self.get_parameter('batch_history_count').value
 
         map_qos = QoSProfile(
             depth=1,
@@ -58,8 +68,12 @@ class Superposition(Node):
         # --- 直近の代表点のworld座標(x, y, yaw)。レーザー点群の変換基準に使う ---
         self.latest_best_pose_world = None
 
-        # --- レーザースキャンの履歴(各スキャンの map 座標系ピクセル点リスト) ---
-        self.laser_history = deque(maxlen=self.history_length)
+        # --- バッチ管理: 時間窓ごとにセンサデータをまとめる ---
+        self.current_batch = {
+            'laser_points': [],  # 現在のバッチ内のレーザー点群
+            'start_time': None
+        }
+        self.batch_history = deque(maxlen=self.batch_history_count)
 
         # --- 最新の描画結果(タイマーでパブリッシュする用) ---
         self.latest_overlay = None
@@ -75,12 +89,21 @@ class Superposition(Node):
 
         self.image_pub = self.create_publisher(Image, '/vlm_context_image', 10)
 
+        # サービス: 現在の画像を /tmp に保存
+        if SaveOverlayImage is not None:
+            self.save_service = self.create_service(
+                SaveOverlayImage, '/save_overlay_image', self.save_overlay_callback)
+
         # パブリッシュ周期はパーティクル受信頻度と独立させ、タイマーで一定周期に揃える
         period = 1.0 / self.publish_rate if self.publish_rate > 0 else 0.5
         self.timer = self.create_timer(period, self.timer_callback)
 
+        # バッチ時間窓のチェックタイマー（0.1秒ごと）
+        self.batch_timer = self.create_timer(0.1, self.batch_window_callback)
+
         self.get_logger().info(
-            f'起動 (publish_rate={self.publish_rate}Hz, history_length={self.history_length})')
+            f'起動 (publish_rate={self.publish_rate}Hz, history_length={self.history_length}, '
+            f'batch_window_seconds={self.batch_window_seconds}s, batch_history_count={self.batch_history_count})')
 
     # ------------------------------------------------------------------
     def map_callback(self, msg):
@@ -157,12 +180,17 @@ class Superposition(Node):
 
     # ------------------------------------------------------------------
     def scan_callback(self, msg: LaserScan):
+        """レーザースキャンを現在のバッチに追加"""
         self.get_logger().info('センサデータ取得')
-        """直近の代表点(自己位置)を基準にレーザー点群をmap座標系へ変換して履歴に追加する"""
         if self.base_map_img is None or self.map_info is None:
             return
         if self.latest_best_pose_world is None:
             return
+
+        # バッチの開始時刻を記録（初回のみ）
+        current_time = self.get_clock().now()
+        if self.current_batch['start_time'] is None:
+            self.current_batch['start_time'] = current_time
 
         robot_x, robot_y, robot_yaw = self.latest_best_pose_world
         cos_yaw = math.cos(robot_yaw)
@@ -190,24 +218,45 @@ class Superposition(Node):
 
             angle += msg.angle_increment
 
-        self.laser_history.append(points)
+        # 現在のバッチにセンサデータを追加
+        self.current_batch['laser_points'].extend(points)
         self.latest_overlay = self.render_overlay()
+
+    # ------------------------------------------------------------------
+    def batch_window_callback(self):
+        """時間窓をチェックして、バッチを履歴に保存"""
+        if self.current_batch['start_time'] is None:
+            return
+
+        current_time = self.get_clock().now()
+        elapsed = (current_time - self.current_batch['start_time']).nanoseconds / 1e9
+
+        if elapsed >= self.batch_window_seconds:
+            self.get_logger().info(
+                f'バッチ確定: {len(self.current_batch["laser_points"])}点')
+            self.batch_history.append({
+                'laser_points': self.current_batch['laser_points'].copy(),
+                'timestamp': self.current_batch['start_time']
+            })
+            # 新しいバッチを開始
+            self.current_batch = {
+                'laser_points': [],
+                'start_time': None
+            }
 
     # ------------------------------------------------------------------
     def render_overlay(self):
         self.get_logger().info('画像描画')
-        """自己位置の代表点と、それを基準にしたレーザー点群を、赤(古)→緑(新)のグラデーションで描画する。
-        新しいものほど後に描いて最前面にする。"""
+        """バッチ履歴内のレーザー点群と、代表点を赤(古)→緑(新)のグラデーションで描画する"""
         overlay = self.base_map_img.copy()
 
-        # レーザー点群の履歴を、古い世代から新しい世代の順に重ねて描画
-        # -> 後に描かれる新しい世代が最前面に来る
-        ln = len(self.laser_history)
-        if ln > 0:
-            for i, points in enumerate(self.laser_history):
-                t = i / (ln - 1) if ln > 1 else 1.0
+        # バッチ履歴のレーザー点群を、古い世代から新しい世代の順に重ねて描画
+        bn = len(self.batch_history)
+        if bn > 0:
+            for batch_idx, batch in enumerate(self.batch_history):
+                t = batch_idx / (bn - 1) if bn > 1 else 1.0
                 color = self.get_particle_color(t)
-                for (px, py) in points:
+                for (px, py) in batch['laser_points']:
                     cv2.circle(overlay, (px, py), self.laser_point_radius, color, -1)
 
         # 代表点(重み付き平均)の履歴を、レーザー点群より後(最前面)に描画
@@ -249,7 +298,8 @@ class Superposition(Node):
         return math.atan2(siny_cosp, cosy_cosp)
 
     # ------------------------------------------------------------------
-    def get_particle_color(self, t):
+    @staticmethod
+    def get_particle_color(t):
         """t(0=最古~1=最新)に応じて 赤(古)→緑(新) のグラデーション色を返す(BGR)"""
         t = max(0.0, min(1.0, t))
         b = 0
@@ -268,6 +318,29 @@ class Superposition(Node):
         out_msg.header.frame_id = self.map_frame_id
         self.image_pub.publish(out_msg)
         self.get_logger().info('画像パブリッシュ')
+
+    # ------------------------------------------------------------------
+    def save_overlay_callback(self, request, response):
+        """サービスコール: 現在の画像を /tmp に保存"""
+        if self.latest_overlay is None:
+            self.get_logger().warn('パブリッシュする画像がありません')
+            response.success = False
+            response.message = 'No overlay image available'
+            return response
+
+        try:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+            filename = f'/tmp/overlay_{timestamp}.png'
+            cv2.imwrite(filename, self.latest_overlay)
+            response.success = True
+            response.message = f'Image saved to {filename}'
+            self.get_logger().info(f'画像を保存: {filename}')
+        except Exception as e:
+            self.get_logger().error(f'画像保存エラー: {e}')
+            response.success = False
+            response.message = f'Error saving image: {str(e)}'
+
+        return response
 
 
 def main(args=None):
