@@ -3,7 +3,7 @@
 <package format="3">
   <name>vlm_kidnapping_detect</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>vlmで誘拐ロボット問題を検知する</description>
   <maintainer email="junya.wada.27@gmail.com">junya</maintainer>
   <license>BSD-3-Clause</license>
 
@@ -13,6 +13,8 @@
   <test_depend>python3-pytest</test_depend>
 
   <depend>nav2_msgs</depend>
+  <depend>rosidl_default_generators</depend>
+  <depend>rosidl_default_runtime</depend>
 
   <export>
     <build_type>ament_python</build_type>
