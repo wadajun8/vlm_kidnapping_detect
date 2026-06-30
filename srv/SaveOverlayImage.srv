@@ -1,0 +1,8 @@
+# Request
+# (No fields - this service takes no arguments)
+
+---
+
+# Response
+bool success
+string message
