@@ -20,6 +20,40 @@ ros2 run vlm_kidnapping_detect superposition \
   -p snapshot_count:=3
 ```
 
+### 表示内容のカスタマイズ
+
+各要素の表示/非表示をパラメータで制御できます：
+
+```bash
+# パーティクルのみ表示
+ros2 run vlm_kidnapping_detect superposition \
+  --ros-args \
+  -p show_particles:=true \
+  -p show_laser_scan:=false \
+  -p show_best_pose:=false
+
+# パーティクル + センサデータ表示
+ros2 run vlm_kidnapping_detect superposition \
+  --ros-args \
+  -p show_particles:=true \
+  -p show_laser_scan:=true \
+  -p show_best_pose:=false
+
+# パーティクル + 代表位置表示
+ros2 run vlm_kidnapping_detect superposition \
+  --ros-args \
+  -p show_particles:=true \
+  -p show_laser_scan:=false \
+  -p show_best_pose:=true
+
+# 全て表示（デフォルト）
+ros2 run vlm_kidnapping_detect superposition \
+  --ros-args \
+  -p show_particles:=true \
+  -p show_laser_scan:=true \
+  -p show_best_pose:=true
+```
+
 画像を保存する場合:
 
 ```bash
@@ -40,7 +74,7 @@ ros2 service call /save_overlay_image std_srvs/srv/Trigger
 
 | トピック | 型 | 説明 |
 |---|---|---|
-| `/vlm_context_image` | `sensor_msgs/msg/Image` | 重畳画像(bgr8) |
+| `/vlm_context_image` | `sensor_msgs/msg/Image` | 重畳画��(bgr8) |
 
 ## その他
 
@@ -50,7 +84,10 @@ ros2 service call /save_overlay_image std_srvs/srv/Trigger
 |---|---|---|---|
 | `capture_interval_sec` | double | `1.0` | スナップショット取得間隔 [秒] |
 | `snapshot_count` | int | `5` | 重ねる世代数 |
+| `show_particles` | bool | `True` | パーティクルを描画するか |
+| `show_laser_scan` | bool | `True` | LiDAR点群を描画するか |
 | `show_best_pose` | bool | `True` | 自己位置マーカーを描画するか |
+| `particle_radius` | int | `2` | パーティクルの描画半径 [px] |
 | `best_pose_radius` | int | `4` | 自己位置マーカーの基準半径 [px] |
 | `laser_point_radius` | int | `1` | LiDAR点群の描画半径 [px] |
 
@@ -62,9 +99,11 @@ ros2 service call /save_overlay_image std_srvs/srv/Trigger
 
 ### 描画仕様
 
-- Jetグラデーション(青=古 → シアン → 緑 → 黄 → 赤=新)で世代を色分け
-- 古い→新しい順で描画し、新しいものが最前面に表示される
-- 自己位置マーカーはLiDAR点群より前面。新しいものほど半径が大きく、向きを矢印で表示
+- **Jetグラデーション**: 青(古) → シアン → 緑 → 黄 → 赤(新)で世代を色分け
+- **描画順序**: 古い→新しい順で描画し、新しいものが最前面に表示される
+- **パーティクル**: 円で描画、重みが大きいほど半径が大きくなる
+- **LiDAR点群**: 小さな円で描画
+- **自己位置マーカー**: LiDAR点群より前面に表示。新しいものほど半径が大きく、向きを矢印で表示
 
 ### 依存パッケージ
 
