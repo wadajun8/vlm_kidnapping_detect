@@ -28,13 +28,20 @@ class Superposition(Node):
         self.declare_parameter('capture_interval_sec', 1.0)
         # m: 何世代分(何秒分)のスナップショットを重ねるか
         self.declare_parameter('snapshot_count', 5)
-        self.declare_parameter('show_best_pose', True)   # 自己位置代表点を描画するか
-        self.declare_parameter('best_pose_radius', 4)    # 代表点の基準半径[px]
-        self.declare_parameter('laser_point_radius', 1)  # レーザー点群の半径[px]
+        # 表示制御パラメータ
+        self.declare_parameter('show_particles', True)        # パーティクルを表示するか
+        self.declare_parameter('show_laser_scan', True)       # ライダーデータを表示するか
+        self.declare_parameter('show_best_pose', True)        # 代表位置を表示するか
+        self.declare_parameter('particle_radius', 2)          # パーティクルのサイズ[px]
+        self.declare_parameter('best_pose_radius', 4)         # 代表点の基準半径[px]
+        self.declare_parameter('laser_point_radius', 1)       # レーザー点群の半径[px]
 
         self.capture_interval_sec = self.get_parameter('capture_interval_sec').value
         self.snapshot_count = self.get_parameter('snapshot_count').value
+        self.show_particles = self.get_parameter('show_particles').value
+        self.show_laser_scan = self.get_parameter('show_laser_scan').value
         self.show_best_pose = self.get_parameter('show_best_pose').value
+        self.particle_radius = self.get_parameter('particle_radius').value
         self.best_pose_radius = self.get_parameter('best_pose_radius').value
         self.laser_point_radius = self.get_parameter('laser_point_radius').value
 
@@ -59,7 +66,7 @@ class Superposition(Node):
         self.latest_scan_msg = None
 
         # --- スナップショット履歴 ---
-        # 各エントリ: {'pose': (bpx, bpy, yaw) or None, 'laser_points': [(px,py), ...]}
+        # 各エントリ: {'pose': (bpx, bpy, yaw) or None, 'particles': [...], 'laser_points': [...]}
         # deque(maxlen=snapshot_count) で古いものが自動的に捨てられる
         self.snapshot_history = deque(maxlen=self.snapshot_count)
 
@@ -86,7 +93,10 @@ class Superposition(Node):
 
         self.get_logger().info(
             f'起動 (capture_interval={self.capture_interval_sec}s, '
-            f'snapshot_count={self.snapshot_count})')
+            f'snapshot_count={self.snapshot_count}, '
+            f'show_particles={self.show_particles}, '
+            f'show_laser_scan={self.show_laser_scan}, '
+            f'show_best_pose={self.show_best_pose})')
 
     # ------------------------------------------------------------------
     def map_callback(self, msg):
@@ -130,10 +140,14 @@ class Superposition(Node):
         # 自己位置の代表点(重み付き平均)を計算
         pose_px = self.compute_best_pose_pixel(self.latest_particle_msg)
 
+        # パーティクルをピクセル座標に変換
+        particle_pixels = []
+        if self.show_particles:
+            particle_pixels = self.compute_particles_pixels(self.latest_particle_msg)
+
         # レーザー点群をmap座標系のピクセルに変換
         laser_points = []
-        if self.latest_scan_msg is not None and pose_px is not None:
-            # 変換基準はピクセル座標ではなくworld座標が必要なので再計算する
+        if self.show_laser_scan and self.latest_scan_msg is not None and pose_px is not None:
             best_pose_world = self.compute_best_pose_world(self.latest_particle_msg)
             if best_pose_world is not None:
                 laser_points = self.transform_scan_to_pixels(
@@ -141,13 +155,14 @@ class Superposition(Node):
 
         # スナップショットをキューに追加(maxlenにより古いものは自動で削除される)
         self.snapshot_history.append({
-            'pose': pose_px,           # (bpx, bpy, yaw) or None
+            'pose': pose_px,
+            'particles': particle_pixels,
             'laser_points': laser_points
         })
 
         self.get_logger().info(
             f'キャプチャ #{len(self.snapshot_history)}/{self.snapshot_count} '
-            f'(laser: {len(laser_points)}点)')
+            f'(particles: {len(particle_pixels)}個, laser: {len(laser_points)}点)')
 
         # 描画してパブリッシュ
         self.latest_overlay = self.render_overlay()
@@ -184,6 +199,18 @@ class Superposition(Node):
         if 0 <= bpx < self.map_info.width and 0 <= bpy < self.map_info.height:
             return (bpx, bpy, mean_yaw)
         return None
+
+    # ------------------------------------------------------------------
+    def compute_particles_pixels(self, particle_msg: ParticleCloud):
+        """ParticleCloudの全パーティクルをピクセル座標に変換する"""
+        particles = []
+        for particle in particle_msg.particles:
+            x = particle.pose.position.x
+            y = particle.pose.position.y
+            px, py = self.world_to_pixel(x, y)
+            if 0 <= px < self.map_info.width and 0 <= py < self.map_info.height:
+                particles.append((px, py, particle.weight))
+        return particles
 
     # ------------------------------------------------------------------
     def transform_scan_to_pixels(self, scan_msg: LaserScan, robot_pose_world):
@@ -228,7 +255,7 @@ class Superposition(Node):
     # ------------------------------------------------------------------
     def render_overlay(self):
         """スナップショット履歴を古い順(赤)→新しい順(緑)でマップに重ねて描画する。
-        各スナップショット内でレーザー点群→自己位置の順に描き、自己位置が常に最前面になる。"""
+        show_* パラメータで表示要素をコントロールする。"""
         overlay = self.base_map_img.copy()
         n = len(self.snapshot_history)
         if n == 0:
@@ -239,11 +266,19 @@ class Superposition(Node):
             t = i / (n - 1) if n > 1 else 1.0
             color = self.get_color(t)
 
-            # レーザー点群を描画
-            for (px, py) in snapshot['laser_points']:
-                cv2.circle(overlay, (px, py), self.laser_point_radius, color, -1)
+            # パーティクルを描画（重みの大きさで透明度を変動させる）
+            if self.show_particles:
+                for (px, py, weight) in snapshot['particles']:
+                    # 重みが小さいと薄く表示
+                    radius = max(1, int(self.particle_radius * (0.5 + weight)))
+                    cv2.circle(overlay, (px, py), radius, color, 1)
 
-            # 自己位置の代表点をレーザー点群より後(最前面)に描画
+            # レーザー点群を描画
+            if self.show_laser_scan:
+                for (px, py) in snapshot['laser_points']:
+                    cv2.circle(overlay, (px, py), self.laser_point_radius, color, -1)
+
+            # 自己位置の代表点を描画（最前面）
             if self.show_best_pose and snapshot['pose'] is not None:
                 bpx, bpy, yaw = snapshot['pose']
                 self.draw_best_pose(overlay, bpx, bpy, yaw, t)
