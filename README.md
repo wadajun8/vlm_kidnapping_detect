@@ -20,6 +20,26 @@ ros2 run vlm_kidnapping_detect superposition \
   -p snapshot_count:=3
 ```
 
+### パーティクルトピックの指定（AMCL / EMCL 対応）
+
+**AMCL（デフォルト）を使用する場合:**
+
+```bash
+ros2 run vlm_kidnapping_detect superposition \
+  --ros-args \
+  -p particle_topic:='/particle_cloud' \
+  -p particle_msg_type:='ParticleCloud'
+```
+
+**EMCL（または PoseArray 型のパーティクル）を使用する場合:**
+
+```bash
+ros2 run vlm_kidnapping_detect superposition \
+  --ros-args \
+  -p particle_topic:='/particles' \
+  -p particle_msg_type:='PoseArray'
+```
+
 ### 表示内容のカスタマイズ
 
 各要素の表示/非表示をパラメータで制御できます：
@@ -54,6 +74,18 @@ ros2 run vlm_kidnapping_detect superposition \
   -p show_best_pose:=true
 ```
 
+**EMCL + パーティクル非表示の例:**
+
+```bash
+ros2 run vlm_kidnapping_detect superposition \
+  --ros-args \
+  -p particle_topic:='/particles' \
+  -p particle_msg_type:='PoseArray' \
+  -p show_particles:=false \
+  -p show_laser_scan:=true \
+  -p show_best_pose:=true
+```
+
 画像を保存する場合:
 
 ```bash
@@ -67,14 +99,17 @@ ros2 service call /save_overlay_image std_srvs/srv/Trigger
 | トピック | 型 | QoS | 説明 |
 |---|---|---|---|
 | `/map` | `nav_msgs/msg/OccupancyGrid` | RELIABLE / TRANSIENT_LOCAL | 背景マップ |
-| `/particle_cloud` | `nav2_msgs/msg/ParticleCloud` | BEST_EFFORT / VOLATILE | AMCLパーティクル群 |
+| `/particle_cloud` (デフォルト) | `nav2_msgs/msg/ParticleCloud` | BEST_EFFORT / VOLATILE | AMCLパーティクル群 |
+| `/particles` (EMCL時) | `geometry_msgs/msg/PoseArray` | BEST_EFFORT / VOLATILE | EMCLパーティクル群 |
 | `/scan` | `sensor_msgs/msg/LaserScan` | BEST_EFFORT (sensor_data) | LiDARスキャン |
+
+※ パーティクルトピック名はパラメータで変更可能
 
 ## パブリッシュ
 
 | トピック | 型 | 説明 |
 |---|---|---|
-| `/vlm_context_image` | `sensor_msgs/msg/Image` | 重畳画��(bgr8) |
+| `/vlm_context_image` | `sensor_msgs/msg/Image` | 重畳画像(bgr8) |
 
 ## その他
 
@@ -84,6 +119,8 @@ ros2 service call /save_overlay_image std_srvs/srv/Trigger
 |---|---|---|---|
 | `capture_interval_sec` | double | `1.0` | スナップショット取得間隔 [秒] |
 | `snapshot_count` | int | `5` | 重ねる世代数 |
+| `particle_topic` | string | `/particle_cloud` | パーティクルトピック名 |
+| `particle_msg_type` | string | `ParticleCloud` | パーティクルメッセージ型 (`ParticleCloud` または `PoseArray`) |
 | `show_particles` | bool | `True` | パーティクルを描画するか |
 | `show_laser_scan` | bool | `True` | LiDAR点群を描画するか |
 | `show_best_pose` | bool | `True` | 自己位置マーカーを描画するか |
@@ -109,6 +146,7 @@ ros2 service call /save_overlay_image std_srvs/srv/Trigger
 
 ```xml
 <depend>nav2_msgs</depend>
+<depend>geometry_msgs</depend>
 <depend>std_srvs</depend>
 ```
 
