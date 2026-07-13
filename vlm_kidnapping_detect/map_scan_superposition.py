@@ -10,6 +10,7 @@ from collections import deque
 from datetime import datetime
 from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.msg import ParticleCloud
+from geometry_msgs.msg import PoseArray
 from sensor_msgs.msg import Image, LaserScan
 from cv_bridge import CvBridge
 from rclpy.qos import (
@@ -28,6 +29,10 @@ class Superposition(Node):
         self.declare_parameter('capture_interval_sec', 1.0)
         # m: 何世代分(何秒分)のスナップショットを重ねるか
         self.declare_parameter('snapshot_count', 5)
+        # パーティクルトピック名 (AMCL: /particle_cloud, EMCL: /particles など)
+        self.declare_parameter('particle_topic', '/particle_cloud')
+        # パーティクルメッセージ型 ('ParticleCloud' or 'PoseArray')
+        self.declare_parameter('particle_msg_type', 'ParticleCloud')
         # 表示制御パラメータ
         self.declare_parameter('show_particles', True)        # パーティクルを表示するか
         self.declare_parameter('show_laser_scan', True)       # ライダーデータを表示するか
@@ -38,6 +43,8 @@ class Superposition(Node):
 
         self.capture_interval_sec = self.get_parameter('capture_interval_sec').value
         self.snapshot_count = self.get_parameter('snapshot_count').value
+        self.particle_topic = self.get_parameter('particle_topic').value
+        self.particle_msg_type = self.get_parameter('particle_msg_type').value
         self.show_particles = self.get_parameter('show_particles').value
         self.show_laser_scan = self.get_parameter('show_laser_scan').value
         self.show_best_pose = self.get_parameter('show_best_pose').value
@@ -77,8 +84,15 @@ class Superposition(Node):
 
         self.map_sub = self.create_subscription(
             OccupancyGrid, '/map', self.map_callback, map_qos)
-        self.particle_sub = self.create_subscription(
-            ParticleCloud, '/particle_cloud', self.particle_callback, particle_qos)
+        
+        # パーティクルトピックをメッセージ型に応じて購読
+        if self.particle_msg_type == 'PoseArray':
+            self.particle_sub = self.create_subscription(
+                PoseArray, self.particle_topic, self.particle_callback_posearray, particle_qos)
+        else:  # デフォルト: ParticleCloud
+            self.particle_sub = self.create_subscription(
+                ParticleCloud, self.particle_topic, self.particle_callback, particle_qos)
+        
         self.scan_sub = self.create_subscription(
             LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data)
 
@@ -92,7 +106,9 @@ class Superposition(Node):
             self.capture_interval_sec, self.capture_callback)
 
         self.get_logger().info(
-            f'起動 (capture_interval={self.capture_interval_sec}s, '
+            f'起動 (particle_topic={self.particle_topic}, '
+            f'particle_msg_type={self.particle_msg_type}, '
+            f'capture_interval={self.capture_interval_sec}s, '
             f'snapshot_count={self.snapshot_count}, '
             f'show_particles={self.show_particles}, '
             f'show_laser_scan={self.show_laser_scan}, '
@@ -117,7 +133,20 @@ class Superposition(Node):
 
     # ------------------------------------------------------------------
     def particle_callback(self, msg: ParticleCloud):
-        """最新のパーティクルメッセージをキャッシュするだけ(履歴反映はcapture_timerで行う)"""
+        """最新のParticleCloudメッセージをキャッシュするだけ(履歴反映はcapture_timerで行う)"""
+        self.latest_particle_msg = msg
+
+    # ------------------------------------------------------------------
+    def particle_callback_posearray(self, msg: PoseArray):
+        """最新のPoseArrayメッセージをキャッシュするだけ(履歴反映はcapture_timerで行う)
+        PoseArrayを内部形式に変換して保存"""
+        # PoseArrayをParticleCloud風に変換(重みは均等に1.0/len(poses))
+        if len(msg.poses) == 0:
+            self.latest_particle_msg = None
+            return
+        
+        # 簡易的にParticleCloud型のmsgオブジェクトを作成
+        # (実際にはParticleCloudではなく、内部的にPoseArrayとして処理)
         self.latest_particle_msg = msg
 
     # ------------------------------------------------------------------
@@ -169,18 +198,30 @@ class Superposition(Node):
         self.publish_image()
 
     # ------------------------------------------------------------------
-    def compute_best_pose_world(self, particle_msg: ParticleCloud):
-        """ParticleCloudから重み付き平均(world座標)を計算する"""
+    def compute_best_pose_world(self, particle_msg):
+        """ParticleCloud または PoseArray から重み付き平均(world座標)を計算する"""
         sum_w = sum_x = sum_y = sum_sin = sum_cos = 0.0
 
-        for particle in particle_msg.particles:
-            w = particle.weight
-            sum_w += w
-            sum_x += w * particle.pose.position.x
-            sum_y += w * particle.pose.position.y
-            yaw = self.quaternion_to_yaw(particle.pose.orientation)
-            sum_sin += w * math.sin(yaw)
-            sum_cos += w * math.cos(yaw)
+        if isinstance(particle_msg, ParticleCloud):
+            # ParticleCloud型: 重みが設定されている
+            for particle in particle_msg.particles:
+                w = particle.weight
+                sum_w += w
+                sum_x += w * particle.pose.position.x
+                sum_y += w * particle.pose.position.y
+                yaw = self.quaternion_to_yaw(particle.pose.orientation)
+                sum_sin += w * math.sin(yaw)
+                sum_cos += w * math.cos(yaw)
+        else:
+            # PoseArray型: 重みは均等(1.0)
+            for pose in particle_msg.poses:
+                w = 1.0
+                sum_w += w
+                sum_x += w * pose.position.x
+                sum_y += w * pose.position.y
+                yaw = self.quaternion_to_yaw(pose.orientation)
+                sum_sin += w * math.sin(yaw)
+                sum_cos += w * math.cos(yaw)
 
         if sum_w <= 0.0:
             return None
@@ -188,8 +229,8 @@ class Superposition(Node):
         return (sum_x / sum_w, sum_y / sum_w, math.atan2(sum_sin, sum_cos))
 
     # ------------------------------------------------------------------
-    def compute_best_pose_pixel(self, particle_msg: ParticleCloud):
-        """ParticleCloudから重み付き平均をピクセル座標で返す。(px, py, yaw) or None"""
+    def compute_best_pose_pixel(self, particle_msg):
+        """ParticleCloud または PoseArray から重み付き平均をピクセル座標で返す。(px, py, yaw) or None"""
         world = self.compute_best_pose_world(particle_msg)
         if world is None:
             return None
@@ -201,15 +242,28 @@ class Superposition(Node):
         return None
 
     # ------------------------------------------------------------------
-    def compute_particles_pixels(self, particle_msg: ParticleCloud):
-        """ParticleCloudの全パーティクルをピクセル座標に変換する"""
+    def compute_particles_pixels(self, particle_msg):
+        """ParticleCloud または PoseArray の全パーティクルをピクセル座標に変換する"""
         particles = []
-        for particle in particle_msg.particles:
-            x = particle.pose.position.x
-            y = particle.pose.position.y
-            px, py = self.world_to_pixel(x, y)
-            if 0 <= px < self.map_info.width and 0 <= py < self.map_info.height:
-                particles.append((px, py, particle.weight))
+
+        if isinstance(particle_msg, ParticleCloud):
+            # ParticleCloud型
+            for particle in particle_msg.particles:
+                x = particle.pose.position.x
+                y = particle.pose.position.y
+                px, py = self.world_to_pixel(x, y)
+                if 0 <= px < self.map_info.width and 0 <= py < self.map_info.height:
+                    particles.append((px, py, particle.weight))
+        else:
+            # PoseArray型: 重みは均等に設定
+            weight = 1.0 / len(particle_msg.poses) if len(particle_msg.poses) > 0 else 1.0
+            for pose in particle_msg.poses:
+                x = pose.position.x
+                y = pose.position.y
+                px, py = self.world_to_pixel(x, y)
+                if 0 <= px < self.map_info.width and 0 <= py < self.map_info.height:
+                    particles.append((px, py, weight))
+        
         return particles
 
     # ------------------------------------------------------------------
