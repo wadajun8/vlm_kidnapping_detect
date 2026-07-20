@@ -31,13 +31,13 @@ ros2 run vlm_kidnapping_detect superposition \
   -p particle_msg_type:='ParticleCloud'
 ```
 
-**EMCL（または PoseArray 型のパーティクル）を使用する場合:**
+**[emcl2](https://github.com/ryuichiueda/emcl2)（または PoseArray 型のパーティクル）を使用する場合:**
 
 ```bash
 ros2 run vlm_kidnapping_detect superposition \
   --ros-args \
-  -p particle_topic:='/particles' \
-  -p particle_msg_type:='PoseArray'
+  -p particle_topic:=/particlecloud \
+  -p particle_msg_type:=PoseArray
 ```
 
 ### 表示内容のカスタマイズ
