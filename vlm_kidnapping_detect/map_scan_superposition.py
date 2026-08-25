@@ -333,8 +333,8 @@ class Superposition(Node):
                     radius = max(1, int(self.particle_radius * (0.5 + weight)))
                     cv2.circle(overlay, (px, py), radius, color, 1)
 
-            # レーザー点群を描画
-            if self.show_laser_scan:
+            # レーザー点群を描画（★変更箇所：最新の1つだけ描画する）
+            if self.show_laser_scan and i == n - 1:
                 for (px, py) in snapshot['laser_points']:
                     cv2.circle(overlay, (px, py), self.laser_point_radius, color, -1)
 

@@ -1,7 +1,7 @@
 # vlm_kidnapping_detect
 
 VLMを用いて誘拐ロボット問題を検知するROS2パッケージ。
-現時点では、マップ・自己位置・LiDARを時系列で重畳した画像のパブリッシュまで実装済み。
+現時点では、マップ・自己位置・LiDARを重畳した画像のパブリッシュと、カスタムサービスを利用した画像の連続保存機能が実装されています。
 
 ## クイックスタート
 
@@ -9,6 +9,7 @@ VLMを用いて誘拐ロボット問題を検知するROS2パッケージ。
 colcon build --packages-select vlm_kidnapping_detect
 source install/setup.bash
 ros2 run vlm_kidnapping_detect superposition
+
 ```
 
 パラメータを指定して起動する場合:
@@ -18,6 +19,7 @@ ros2 run vlm_kidnapping_detect superposition \
   --ros-args \
   -p capture_interval_sec:=2.0 \
   -p snapshot_count:=3
+
 ```
 
 ### パーティクルトピックの指定（AMCL / EMCL 対応）
@@ -29,6 +31,7 @@ ros2 run vlm_kidnapping_detect superposition \
   --ros-args \
   -p particle_topic:='/particle_cloud' \
   -p particle_msg_type:='ParticleCloud'
+
 ```
 
 **[emcl2](https://github.com/ryuichiueda/emcl2)（または PoseArray 型のパーティクル）を使用する場合:**
@@ -38,6 +41,7 @@ ros2 run vlm_kidnapping_detect superposition \
   --ros-args \
   -p particle_topic:=/particlecloud \
   -p particle_msg_type:=PoseArray
+
 ```
 
 ### 表示内容のカスタマイズ
@@ -72,6 +76,7 @@ ros2 run vlm_kidnapping_detect superposition \
   -p show_particles:=true \
   -p show_laser_scan:=true \
   -p show_best_pose:=true
+
 ```
 
 **EMCL + パーティクル非表示の例:**
@@ -84,20 +89,35 @@ ros2 run vlm_kidnapping_detect superposition \
   -p show_particles:=false \
   -p show_laser_scan:=true \
   -p show_best_pose:=true
+
 ```
 
-画像を保存する場合:
+### 画像の保存（カスタムサービス）
+
+サービスを呼び出すことで、現在の重畳画像を保存できます。引数により1枚のみの保存、または指定間隔での連続保存が可能です。
+
+**1枚だけ保存する場合:**
 
 ```bash
-ros2 service call /save_overlay_image std_srvs/srv/Trigger
+ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage "{num_images: 1, interval_sec: 0.0}"
+
+```
+
+**指定間隔で連続保存する場合（例: 5秒ごとに合計5枚）:**
+
+```bash
+ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage "{num_images: 5, interval_sec: 5.0}"
+
 ```
 
 保存先: `/tmp/overlay_YYYYMMDD_HHMMSS_mmm.png`
 
+---
+
 ## サブスクライブ
 
 | トピック | 型 | QoS | 説明 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `/map` | `nav_msgs/msg/OccupancyGrid` | RELIABLE / TRANSIENT_LOCAL | 背景マップ |
 | `/particle_cloud` (デフォルト) | `nav2_msgs/msg/ParticleCloud` | BEST_EFFORT / VOLATILE | AMCLパーティクル群 |
 | `/particles` (EMCL時) | `geometry_msgs/msg/PoseArray` | BEST_EFFORT / VOLATILE | EMCLパーティクル群 |
@@ -108,7 +128,7 @@ ros2 service call /save_overlay_image std_srvs/srv/Trigger
 ## パブリッシュ
 
 | トピック | 型 | 説明 |
-|---|---|---|
+| --- | --- | --- |
 | `/vlm_context_image` | `sensor_msgs/msg/Image` | 重畳画像(bgr8) |
 
 ## その他
@@ -116,7 +136,7 @@ ros2 service call /save_overlay_image std_srvs/srv/Trigger
 ### パラメータ
 
 | パラメータ名 | 型 | デフォルト | 説明 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `capture_interval_sec` | double | `1.0` | スナップショット取得間隔 [秒] |
 | `snapshot_count` | int | `5` | 重ねる世代数 |
 | `particle_topic` | string | `/particle_cloud` | パーティクルトピック名 |
@@ -131,25 +151,30 @@ ros2 service call /save_overlay_image std_srvs/srv/Trigger
 ### サービス
 
 | サービス名 | 型 | 説明 |
-|---|---|---|
-| `/save_overlay_image` | `std_srvs/srv/Trigger` | 現在の重畳画像を `/tmp` に保存 |
+| --- | --- | --- |
+| `/save_overlay_image` | `vlm_kidnapping_detect/srv/SaveOverlayImage` | 重畳画像を `/tmp` に保存（枚数・間隔指定可） |
 
 ### 描画仕様
 
-- **Jetグラデーション**: 青(古) → シアン → 緑 → 黄 → 赤(新)で世代を色分け
-- **描画順序**: 古い→新しい順で描画し、新しいものが最前面に表示される
-- **パーティクル**: 円で描画、重みが大きいほど半径が大きくなる
-- **LiDAR点群**: 小さな円で描画
-- **自己位置マーカー**: LiDAR点群より前面に表示。新しいものほど半径が大きく、向きを矢印で表示
+* **Jetグラデーション**: 青(古) → シアン → 緑 → 黄 → 赤(新)で世代を色分け
+* **描画順序**: 古い→新しい順で描画し、新しいものが最前面に表示される
+* **パーティクル**: 円で描画、重みが大きいほど半径が大きくなる
+* **LiDAR点群**: 最新の1世代分（現在時刻のもの）のみを小さな円で描画
+* **自己位置マーカー**: LiDAR点群より前面に表示。新しいものほど半径が大きく、向きを矢印で表示
 
-### 依存パッケージ
+### 依存パッケージ（主なもの）
 
 ```xml
 <depend>nav2_msgs</depend>
 <depend>geometry_msgs</depend>
-<depend>std_srvs</depend>
+<buildtool_depend>ament_cmake</buildtool_depend>
+<buildtool_depend>ament_cmake_python</buildtool_depend>
+<buildtool_depend>rosidl_default_generators</buildtool_depend>
+<exec_depend>rosidl_default_runtime</exec_depend>
+
 ```
 
 ## ライセンス
 
 BSD-3-Clause © 2026 Junya Wada
+
