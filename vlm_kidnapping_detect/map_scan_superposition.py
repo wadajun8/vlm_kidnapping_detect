@@ -17,7 +17,8 @@ from rclpy.qos import (
     QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy,
     qos_profile_sensor_data
 )
-from std_srvs.srv import Trigger
+# std_srvs.srvのTriggerを削除し、カスタムサービスをインポート
+from vlm_kidnapping_detect.srv import SaveOverlayImage
 
 
 class Superposition(Node):
@@ -80,6 +81,10 @@ class Superposition(Node):
         # --- 最新の描画結果(サービスコールで保存する用) ---
         self.latest_overlay = None
 
+        # --- 連続保存用の状態管理変数 ---
+        self.continuous_save_timer = None
+        self.images_to_save = 0
+
         self.cv_bridge = CvBridge()
 
         self.map_sub = self.create_subscription(
@@ -98,8 +103,9 @@ class Superposition(Node):
 
         self.image_pub = self.create_publisher(Image, '/vlm_context_image', 10)
 
+        # サービスをカスタムの SaveOverlayImage に変更
         self.save_service = self.create_service(
-            Trigger, '/save_overlay_image', self.save_overlay_callback)
+            SaveOverlayImage, '/save_overlay_image', self.save_overlay_callback)
 
         # capture_interval_sec ごとに「スナップショット取得→描画→パブリッシュ」を一括実行
         self.capture_timer = self.create_timer(
@@ -388,26 +394,68 @@ class Superposition(Node):
 
     # ------------------------------------------------------------------
     def save_overlay_callback(self, request, response):
-        """サービスコール(std_srvs/Trigger): 現在の重畳画像を /tmp に保存する"""
-        if self.latest_overlay is None:
-            response.success = False
-            response.message = 'No overlay image available'
-            self.get_logger().warn('画像未生成のため保存をスキップ')
+        """サービスコール: カスタムsrvで受け取った引数を元に画像を保存、またはタイマーを起動する"""
+        num_images = request.num_images if request.num_images > 0 else 1
+        interval = float(request.interval_sec)
+
+        # 枚数が1枚、または周期が指定されていない(0秒以下)の場合は即座に1枚保存して終了
+        if num_images == 1 or interval <= 0.0:
+            success, msg = self.save_single_image()
+            response.success = success
+            response.message = msg
             return response
+
+        # 複数枚保存の処理（すでにタイマーが動いている場合はキャンセル）
+        if self.continuous_save_timer is not None:
+            self.continuous_save_timer.cancel()
+            self.get_logger().info("以前の保存処理をキャンセルして新しい保存を開始します。")
+
+        self.images_to_save = num_images
+        
+        # 初回の1枚目を即座に保存
+        self.save_single_image()
+        self.images_to_save -= 1
+
+        # 残りの枚数を指定周期で保存するためのタイマーをセット
+        if self.images_to_save > 0:
+            self.continuous_save_timer = self.create_timer(interval, self.timer_save_callback)
+
+        response.success = True
+        response.message = f"{interval}秒ごとに合計{num_images}枚の画像保存を開始しました。"
+        return response
+
+    # ------------------------------------------------------------------
+    def timer_save_callback(self):
+        """タイマーによって周期的に呼ばれるコールバック"""
+        if self.images_to_save > 0:
+            self.save_single_image()
+            self.images_to_save -= 1
+
+        # 指定枚数の保存が完了したらタイマーを停止・破棄
+        if self.images_to_save <= 0:
+            if self.continuous_save_timer is not None:
+                self.continuous_save_timer.cancel()
+                self.continuous_save_timer = None
+            self.get_logger().info("指定された全画像の連続保存が完了しました。")
+
+    # ------------------------------------------------------------------
+    def save_single_image(self):
+        """1枚の画像をタイムスタンプ付きで保存し、成否とメッセージを返す"""
+        if self.latest_overlay is None:
+            msg = 'No overlay image available'
+            self.get_logger().warn('画像未生成のため保存をスキップ')
+            return False, msg
 
         try:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
             filename = f'/tmp/overlay_{timestamp}.png'
             cv2.imwrite(filename, self.latest_overlay)
-            response.success = True
-            response.message = f'Image saved to {filename}'
             self.get_logger().info(f'画像を保存: {filename}')
+            return True, f'Image saved to {filename}'
         except Exception as e:
-            response.success = False
-            response.message = f'Error saving image: {e}'
+            msg = f'Error saving image: {e}'
             self.get_logger().error(f'画像保存エラー: {e}')
-
-        return response
+            return False, msg
 
 
 def main(args=None):

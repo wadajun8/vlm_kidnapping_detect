@@ -1,8 +1,10 @@
 # Request
 # (No fields - this service takes no arguments)
 
+# リクエスト
+int32 num_images      # 保存枚数 (デフォルトで1を指定する運用を想定)
+float32 interval_sec  # 保存周期 (秒)
 ---
-
 # Response
 bool success
 string message
