@@ -1,469 +1,543 @@
 #!/usr/bin/python3
 # SPDX-FileCopyrightText: 2026 Junya Wada
 # SPDX-License-Identifier: BSD-3-Clause
-import rclpy
-from rclpy.node import Node
-import numpy as np
-import cv2
+"""
+パーティクルフィルタ(AMCL等)の推定結果と地図・スキャンを重畳描画し、
+VLMへのコンテキスト画像として配信・保存するROS2ノード。
+
+責務ごとに以下のクラスへ分割している:
+    MapImage        : OccupancyGrid -> ベース画像、および世界座標<->画素座標変換
+    PoseEstimator    : ParticleCloud / PoseArray から推定姿勢・パーティクル画素を計算
+    ScanProjector    : LaserScan を画素座標へ投影
+    OverlayRenderer  : スナップショット履歴を時系列カラーで描画
+    ImageSaver       : 画像のディスク保存
+    Superposition    : 上記を束ねるROS2ノード本体(購読/配信/サービス)
+"""
+from __future__ import annotations
+
 import math
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
-from nav_msgs.msg import OccupancyGrid
-from nav2_msgs.msg import ParticleCloud
-from geometry_msgs.msg import PoseArray
-from sensor_msgs.msg import Image, LaserScan
+from pathlib import Path
+from typing import Deque, List, Optional, Sequence, Tuple, Union
+
+import cv2
+import numpy as np
+import rclpy
 from cv_bridge import CvBridge
+from geometry_msgs.msg import PoseArray, Quaternion
+from nav2_msgs.msg import ParticleCloud
+from nav_msgs.msg import OccupancyGrid
+from rclpy.node import Node
 from rclpy.qos import (
-    QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy,
-    qos_profile_sensor_data
+    QoSDurabilityPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+    qos_profile_sensor_data,
 )
+from sensor_msgs.msg import Image, LaserScan
+
 # std_srvs.srvのTriggerを削除し、カスタムサービスをインポート
 from vlm_kidnapping_detect.srv import SaveOverlayImage
 
+# --- 型エイリアス ---
+Pixel = Tuple[int, int]
+WeightedPixel = Tuple[int, int, float]
+PoseWorld = Tuple[float, float, float]   # x, y, yaw
+PosePixel = Tuple[int, int, float]       # px, py, yaw
+BGRColor = Tuple[int, int, int]
+ParticleMsg = Union[ParticleCloud, PoseArray]
+
+# --- 占有格子の値と描画色 ---
+OCC_FREE = 0
+OCC_OCCUPIED = 100
+OCC_UNKNOWN = -1
+
+COLOR_FREE: BGRColor = (255, 255, 255)
+COLOR_OCCUPIED: BGRColor = (0, 0, 0)
+COLOR_UNKNOWN: BGRColor = (200, 200, 200)
+
+
+def quaternion_to_yaw(q: Quaternion) -> float:
+    """クォータニオンからYaw角を取り出す"""
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+@dataclass
+class Snapshot:
+    """1回分のキャプチャ結果(描画に必要な画素情報のみを保持)"""
+
+    pose: Optional[PosePixel]
+    particles: List[WeightedPixel] = field(default_factory=list)
+    laser_points: List[Pixel] = field(default_factory=list)
+
+
+class MapImage:
+    """OccupancyGridからベース画像を作成し、座標変換を提供する"""
+
+    def __init__(self) -> None:
+        self.image: Optional[np.ndarray] = None
+        self.info = None
+        self.frame_id: str = 'map'
+
+    def update(self, msg: OccupancyGrid) -> None:
+        self.info = msg.info
+        self.frame_id = msg.header.frame_id or 'map'
+
+        grid = np.array(msg.data, dtype=np.int8).reshape(msg.info.height, msg.info.width)
+
+        img = np.zeros((msg.info.height, msg.info.width, 3), dtype=np.uint8)
+        img[grid == OCC_FREE] = COLOR_FREE
+        img[grid == OCC_OCCUPIED] = COLOR_OCCUPIED
+        img[grid == OCC_UNKNOWN] = COLOR_UNKNOWN
+
+        self.image = np.flipud(img).copy()
+
+    @property
+    def ready(self) -> bool:
+        return self.image is not None and self.info is not None
+
+    def world_to_pixel(self, x: float, y: float) -> Pixel:
+        info = self.info
+        res = info.resolution
+        ox = info.origin.position.x
+        oy = info.origin.position.y
+        px = int((x - ox) / res)
+        py = info.height - 1 - int((y - oy) / res)
+        return px, py
+
+    def in_bounds(self, px: int, py: int) -> bool:
+        return 0 <= px < self.info.width and 0 <= py < self.info.height
+
+
+class PoseEstimator:
+    """ParticleCloud / PoseArray の違いを吸収し、推定姿勢とパーティクル画素を計算する"""
+
+    @staticmethod
+    def _weighted_poses(particle_msg: ParticleMsg) -> List[Tuple[float, float, float, float]]:
+        """(x, y, yaw, weight) のリストへ正規化する"""
+        if isinstance(particle_msg, ParticleCloud):
+            return [
+                (
+                    p.pose.position.x,
+                    p.pose.position.y,
+                    quaternion_to_yaw(p.pose.orientation),
+                    p.weight,
+                )
+                for p in particle_msg.particles
+            ]
+
+        poses = particle_msg.poses
+        weight = 1.0 / len(poses) if poses else 1.0
+        return [
+            (p.position.x, p.position.y, quaternion_to_yaw(p.orientation), weight)
+            for p in poses
+        ]
+
+    @classmethod
+    def best_pose_world(cls, particle_msg: ParticleMsg) -> Optional[PoseWorld]:
+        poses = cls._weighted_poses(particle_msg)
+        sum_w = sum(w for *_, w in poses)
+        if sum_w <= 0.0:
+            return None
+
+        sum_x = sum(w * x for x, _, _, w in poses)
+        sum_y = sum(w * y for _, y, _, w in poses)
+        sum_sin = sum(w * math.sin(yaw) for _, _, yaw, w in poses)
+        sum_cos = sum(w * math.cos(yaw) for _, _, yaw, w in poses)
+
+        return sum_x / sum_w, sum_y / sum_w, math.atan2(sum_sin, sum_cos)
+
+    @classmethod
+    def best_pose_pixel(cls, particle_msg: ParticleMsg, map_image: MapImage) -> Optional[PosePixel]:
+        world = cls.best_pose_world(particle_msg)
+        if world is None:
+            return None
+
+        x, y, yaw = world
+        px, py = map_image.world_to_pixel(x, y)
+        if map_image.in_bounds(px, py):
+            return px, py, yaw
+        return None
+
+    @classmethod
+    def particle_pixels(cls, particle_msg: ParticleMsg, map_image: MapImage) -> List[WeightedPixel]:
+        pixels: List[WeightedPixel] = []
+        for x, y, _, w in cls._weighted_poses(particle_msg):
+            px, py = map_image.world_to_pixel(x, y)
+            if map_image.in_bounds(px, py):
+                pixels.append((px, py, w))
+        return pixels
+
+
+class ScanProjector:
+    """LaserScanをロボット姿勢基準で世界座標へ変換し、地図の画素座標へ投影する"""
+
+    @staticmethod
+    def project(scan_msg: LaserScan, robot_pose_world: PoseWorld, map_image: MapImage) -> List[Pixel]:
+        robot_x, robot_y, robot_yaw = robot_pose_world
+        cos_yaw = math.cos(robot_yaw)
+        sin_yaw = math.sin(robot_yaw)
+
+        points: List[Pixel] = []
+        angle = scan_msg.angle_min
+        for r in scan_msg.ranges:
+            if scan_msg.range_min <= r <= scan_msg.range_max and math.isfinite(r):
+                lx = r * math.cos(angle)
+                ly = r * math.sin(angle)
+
+                wx = robot_x + lx * cos_yaw - ly * sin_yaw
+                wy = robot_y + lx * sin_yaw + ly * cos_yaw
+
+                px, py = map_image.world_to_pixel(wx, wy)
+                if map_image.in_bounds(px, py):
+                    points.append((px, py))
+
+            angle += scan_msg.angle_increment
+
+        return points
+
+
+@dataclass
+class RenderConfig:
+    show_particles: bool = True
+    show_laser_scan: bool = True
+    show_best_pose: bool = True
+    particle_radius: int = 2
+    best_pose_radius: int = 4
+    laser_point_radius: int = 1
+
+
+class OverlayRenderer:
+    """スナップショット履歴を時系列カラー(新しいほど赤寄り)でベース画像に描画する"""
+
+    def __init__(self, config: RenderConfig) -> None:
+        self.config = config
+
+    def render(self, base_map_img: np.ndarray, history: Sequence[Snapshot]) -> np.ndarray:
+        overlay = base_map_img.copy()
+        n = len(history)
+        if n == 0:
+            return overlay
+
+        for i, snap in enumerate(history):
+            t = i / (n - 1) if n > 1 else 1.0
+            color = self._color_for(t)
+            is_latest = i == n - 1
+
+            if self.config.show_particles:
+                self._draw_particles(overlay, snap.particles, color)
+
+            if self.config.show_laser_scan and is_latest:
+                self._draw_laser_points(overlay, snap.laser_points, color)
+
+            if self.config.show_best_pose and snap.pose is not None:
+                self._draw_best_pose(overlay, snap.pose, t)
+
+        return overlay
+
+    def _draw_particles(self, img: np.ndarray, particles: Sequence[WeightedPixel], color: BGRColor) -> None:
+        for px, py, weight in particles:
+            radius = max(1, int(self.config.particle_radius * (0.5 + weight)))
+            cv2.circle(img, (px, py), radius, color, 1)
+
+    def _draw_laser_points(self, img: np.ndarray, points: Sequence[Pixel], color: BGRColor) -> None:
+        for px, py in points:
+            cv2.circle(img, (px, py), self.config.laser_point_radius, color, -1)
+
+    def _draw_best_pose(self, img: np.ndarray, pose: PosePixel, t: float) -> None:
+        px, py, yaw = pose
+        color = self._color_for(t)
+        r = max(1, int(self.config.best_pose_radius * (0.4 + 0.6 * t)))
+
+        cv2.circle(img, (px, py), r, (0, 0, 0), 2)
+        cv2.circle(img, (px, py), r, color, -1)
+
+        length = r * 3
+        ex = int(px + length * math.cos(yaw))
+        ey = int(py - length * math.sin(yaw))
+        cv2.arrowedLine(img, (px, py), (ex, ey), (0, 0, 0), 2, tipLength=0.4)
+
+    @staticmethod
+    def _color_for(t: float) -> BGRColor:
+        t = max(0.0, min(1.0, t))
+        hue = int(120 * (1.0 - t))
+        hsv = np.uint8([[[hue, 255, 220]]])
+        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
+        return int(bgr[0]), int(bgr[1]), int(bgr[2])
+
+
+class ImageSaver:
+    """タイムスタンプ付きでオーバーレイ画像・カメラ画像をディスクへ保存する"""
+
+    def __init__(self, output_dir: Union[str, Path] = '.') -> None:
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def save(
+        self,
+        overlay: Optional[np.ndarray],
+        camera_img: Optional[np.ndarray],
+    ) -> Tuple[bool, str]:
+        if overlay is None:
+            return False, 'No overlay image available'
+
+        timestamp = datetime.now().strftime('%Y_%m%d_%H%M')  # 2026_0906_1350 の形式
+        try:
+            overlay_path = self.output_dir / f'{timestamp}_overlay.png'
+            cv2.imwrite(str(overlay_path), overlay)
+            message = f'Overlay saved to {overlay_path}'
+
+            if camera_img is not None:
+                perspective_path = self.output_dir / f'{timestamp}_perspective.png'
+                cv2.imwrite(str(perspective_path), camera_img)
+                message += f', Perspective saved to {perspective_path}'
+
+            return True, message
+        except Exception as e:  # 保存失敗はサービス応答として呼び出し元へ返す
+            return False, f'Error saving images: {e}'
+
+
+@dataclass
+class NodeParams:
+    capture_interval_sec: float = 1.0
+    snapshot_count: int = 5
+    particle_topic: str = '/particle_cloud'
+    particle_msg_type: str = 'ParticleCloud'
+    show_particles: bool = True
+    show_laser_scan: bool = True
+    show_best_pose: bool = True
+    particle_radius: int = 2
+    best_pose_radius: int = 4
+    laser_point_radius: int = 1
+
 
 class Superposition(Node):
-    def __init__(self):
-        super().__init__("superposition")
+    def __init__(self) -> None:
+        super().__init__('superposition')
 
-        # --- パラメータ ---
-        # n: 何秒ごとにスナップショットを取ってパブリッシュするか
-        self.declare_parameter('capture_interval_sec', 1.0)
-        # m: 何世代分(何秒分)のスナップショットを重ねるか
-        self.declare_parameter('snapshot_count', 5)
-        # パーティクルトピック名 (AMCL: /particle_cloud, EMCL: /particles など)
-        self.declare_parameter('particle_topic', '/particle_cloud')
-        # パーティクルメッセージ型 ('ParticleCloud' or 'PoseArray')
-        self.declare_parameter('particle_msg_type', 'ParticleCloud')
-        # 表示制御パラメータ
-        self.declare_parameter('show_particles', True)        # パーティクルを表示するか
-        self.declare_parameter('show_laser_scan', True)       # ライダーデータを表示するか
-        self.declare_parameter('show_best_pose', True)        # 代表位置を表示するか
-        self.declare_parameter('particle_radius', 2)          # パーティクルのサイズ[px]
-        self.declare_parameter('best_pose_radius', 4)         # 代表点の基準半径[px]
-        self.declare_parameter('laser_point_radius', 1)       # レーザー点群の半径[px]
+        self.params = self._load_params()
+        self.map_image = MapImage()
+        self.renderer = OverlayRenderer(RenderConfig(
+            show_particles=self.params.show_particles,
+            show_laser_scan=self.params.show_laser_scan,
+            show_best_pose=self.params.show_best_pose,
+            particle_radius=self.params.particle_radius,
+            best_pose_radius=self.params.best_pose_radius,
+            laser_point_radius=self.params.laser_point_radius,
+        ))
+        self.saver = ImageSaver('/tmp')
+        self.cv_bridge = CvBridge()
 
-        self.capture_interval_sec = self.get_parameter('capture_interval_sec').value
-        self.snapshot_count = self.get_parameter('snapshot_count').value
-        self.particle_topic = self.get_parameter('particle_topic').value
-        self.particle_msg_type = self.get_parameter('particle_msg_type').value
-        self.show_particles = self.get_parameter('show_particles').value
-        self.show_laser_scan = self.get_parameter('show_laser_scan').value
-        self.show_best_pose = self.get_parameter('show_best_pose').value
-        self.particle_radius = self.get_parameter('particle_radius').value
-        self.best_pose_radius = self.get_parameter('best_pose_radius').value
-        self.laser_point_radius = self.get_parameter('laser_point_radius').value
+        # --- 最新メッセージのキャッシュ ---
+        self.latest_particle_msg: Optional[ParticleMsg] = None
+        self.latest_scan_msg: Optional[LaserScan] = None
+        self.latest_camera_msg: Optional[Image] = None
+        self.latest_overlay: Optional[np.ndarray] = None
 
+        # --- スナップショット履歴 ---
+        self.snapshot_history: Deque[Snapshot] = deque(maxlen=self.params.snapshot_count)
+
+        # --- 連続保存用の状態管理変数 ---
+        self._continuous_save_timer = None
+        self._images_to_save = 0
+
+        self._init_subscriptions_and_services()
+
+        self.capture_timer = self.create_timer(
+            self.params.capture_interval_sec, self._on_capture_timer)
+
+        self.get_logger().info(
+            f'起動 (particle_topic={self.params.particle_topic}, '
+            f'particle_msg_type={self.params.particle_msg_type}, '
+            f'capture_interval={self.params.capture_interval_sec}s, '
+            f'snapshot_count={self.params.snapshot_count}, '
+            f'show_particles={self.params.show_particles}, '
+            f'show_laser_scan={self.params.show_laser_scan}, '
+            f'show_best_pose={self.params.show_best_pose})')
+
+    # ------------------------------------------------------------------
+    # 初期化
+    # ------------------------------------------------------------------
+    def _load_params(self) -> NodeParams:
+        defaults = NodeParams()
+        for name, default in vars(defaults).items():
+            self.declare_parameter(name, default)
+        values = {name: self.get_parameter(name).value for name in vars(defaults)}
+        return NodeParams(**values)
+
+    def _init_subscriptions_and_services(self) -> None:
         map_qos = QoSProfile(
             depth=1,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
-            reliability=QoSReliabilityPolicy.RELIABLE
+            reliability=QoSReliabilityPolicy.RELIABLE,
         )
         particle_qos = QoSProfile(
             depth=10,
             durability=QoSDurabilityPolicy.VOLATILE,
-            reliability=QoSReliabilityPolicy.BEST_EFFORT
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
         )
 
-        # --- マップ関連の状態 ---
-        self.base_map_img = None
-        self.map_info = None
-        self.map_frame_id = 'map'
-
-        # --- 最新メッセージのキャッシュ(capture_timerで使う) ---
-        self.latest_particle_msg = None
-        self.latest_scan_msg = None
-
-        # --- スナップショット履歴 ---
-        # 各エントリ: {'pose': (bpx, bpy, yaw) or None, 'particles': [...], 'laser_points': [...]}
-        # deque(maxlen=snapshot_count) で古いものが自動的に捨てられる
-        self.snapshot_history = deque(maxlen=self.snapshot_count)
-
-        # --- 最新の描画結果(サービスコールで保存する用) ---
-        self.latest_overlay = None
-
-        # --- 連続保存用の状態管理変数 ---
-        self.continuous_save_timer = None
-        self.images_to_save = 0
-
-        self.cv_bridge = CvBridge()
-
         self.map_sub = self.create_subscription(
-            OccupancyGrid, '/map', self.map_callback, map_qos)
-        
-        # パーティクルトピックをメッセージ型に応じて購読
-        if self.particle_msg_type == 'PoseArray':
-            self.particle_sub = self.create_subscription(
-                PoseArray, self.particle_topic, self.particle_callback_posearray, particle_qos)
-        else:  # デフォルト: ParticleCloud
-            self.particle_sub = self.create_subscription(
-                ParticleCloud, self.particle_topic, self.particle_callback, particle_qos)
-        
+            OccupancyGrid, '/map', self._on_map, map_qos)
+
+        particle_type = PoseArray if self.params.particle_msg_type == 'PoseArray' else ParticleCloud
+        self.particle_sub = self.create_subscription(
+            particle_type, self.params.particle_topic, self._on_particles, particle_qos)
+
         self.scan_sub = self.create_subscription(
-            LaserScan, '/scan', self.scan_callback, qos_profile_sensor_data)
+            LaserScan, '/scan', self._on_scan, qos_profile_sensor_data)
+
+        self.camera_sub = self.create_subscription(
+            Image, '/camera/color/image_raw', self._on_camera, qos_profile_sensor_data)
 
         self.image_pub = self.create_publisher(Image, '/vlm_context_image', 10)
 
-        # サービスをカスタムの SaveOverlayImage に変更
         self.save_service = self.create_service(
-            SaveOverlayImage, '/save_overlay_image', self.save_overlay_callback)
-
-        # capture_interval_sec ごとに「スナップショット取得→描画→パブリッシュ」を一括実行
-        self.capture_timer = self.create_timer(
-            self.capture_interval_sec, self.capture_callback)
-
-        self.get_logger().info(
-            f'起動 (particle_topic={self.particle_topic}, '
-            f'particle_msg_type={self.particle_msg_type}, '
-            f'capture_interval={self.capture_interval_sec}s, '
-            f'snapshot_count={self.snapshot_count}, '
-            f'show_particles={self.show_particles}, '
-            f'show_laser_scan={self.show_laser_scan}, '
-            f'show_best_pose={self.show_best_pose})')
+            SaveOverlayImage, '/save_overlay_image', self._on_save_overlay_request)
 
     # ------------------------------------------------------------------
-    def map_callback(self, msg):
+    # 購読コールバック
+    # ------------------------------------------------------------------
+    def _on_map(self, msg: OccupancyGrid) -> None:
         self.get_logger().info('マップ受信')
-        self.map_info = msg.info
-        self.map_frame_id = msg.header.frame_id or 'map'
+        self.map_image.update(msg)
 
-        grid = np.array(msg.data, dtype=np.int8).reshape(
-            msg.info.height, msg.info.width)
-
-        img = np.zeros((msg.info.height, msg.info.width, 3), dtype=np.uint8)
-        img[grid == 0] = (255, 255, 255)
-        img[grid == 100] = (0, 0, 0)
-        img[grid == -1] = (200, 200, 200)
-
-        # OccupancyGridは原点が左下基準なので上下反転
-        self.base_map_img = np.flipud(img).copy()
-
-    # ------------------------------------------------------------------
-    def particle_callback(self, msg: ParticleCloud):
-        """最新のParticleCloudメッセージをキャッシュするだけ(履歴反映はcapture_timerで行う)"""
-        self.latest_particle_msg = msg
-
-    # ------------------------------------------------------------------
-    def particle_callback_posearray(self, msg: PoseArray):
-        """最新のPoseArrayメッセージをキャッシュするだけ(履歴反映はcapture_timerで行う)
-        PoseArrayを内部形式に変換して保存"""
-        # PoseArrayをParticleCloud風に変換(重みは均等に1.0/len(poses))
-        if len(msg.poses) == 0:
+    def _on_particles(self, msg: ParticleMsg) -> None:
+        if isinstance(msg, PoseArray) and len(msg.poses) == 0:
             self.latest_particle_msg = None
             return
-        
-        # 簡易的にParticleCloud型のmsgオブジェクトを作成
-        # (実際にはParticleCloudではなく、内部的にPoseArrayとして処理)
         self.latest_particle_msg = msg
 
-    # ------------------------------------------------------------------
-    def scan_callback(self, msg: LaserScan):
-        """最新のスキャンメッセージをキャッシュするだけ(履歴反映はcapture_timerで行う)"""
+    def _on_scan(self, msg: LaserScan) -> None:
         self.latest_scan_msg = msg
 
+    def _on_camera(self, msg: Image) -> None:
+        self.latest_camera_msg = msg
+
     # ------------------------------------------------------------------
-    def capture_callback(self):
-        """capture_interval_sec ごとに呼ばれる。
-        その時点の最新センサデータを1スナップショットとして履歴に追加し、
-        snapshot_count 世代分を重ねた画像を生成してパブリッシュする。"""
-        if self.base_map_img is None or self.map_info is None:
+    # キャプチャ・描画・配信
+    # ------------------------------------------------------------------
+    def _on_capture_timer(self) -> None:
+        if not self.map_image.ready:
             self.get_logger().warn('マップ未受信のためキャプチャをスキップ')
             return
         if self.latest_particle_msg is None:
             self.get_logger().warn('パーティクル未受信のためキャプチャをスキップ')
             return
 
-        # 自己位置の代表点(重み付き平均)を計算
-        pose_px = self.compute_best_pose_pixel(self.latest_particle_msg)
-
-        # パーティクルをピクセル座標に変換
-        particle_pixels = []
-        if self.show_particles:
-            particle_pixels = self.compute_particles_pixels(self.latest_particle_msg)
-
-        # レーザー点群をmap座標系のピクセルに変換
-        laser_points = []
-        if self.show_laser_scan and self.latest_scan_msg is not None and pose_px is not None:
-            best_pose_world = self.compute_best_pose_world(self.latest_particle_msg)
-            if best_pose_world is not None:
-                laser_points = self.transform_scan_to_pixels(
-                    self.latest_scan_msg, best_pose_world)
-
-        # スナップショットをキューに追加(maxlenにより古いものは自動で削除される)
-        self.snapshot_history.append({
-            'pose': pose_px,
-            'particles': particle_pixels,
-            'laser_points': laser_points
-        })
+        snapshot = self._build_snapshot(self.latest_particle_msg)
+        self.snapshot_history.append(snapshot)
 
         self.get_logger().info(
-            f'キャプチャ #{len(self.snapshot_history)}/{self.snapshot_count} '
-            f'(particles: {len(particle_pixels)}個, laser: {len(laser_points)}点)')
+            f'キャプチャ #{len(self.snapshot_history)}/{self.params.snapshot_count} '
+            f'(particles: {len(snapshot.particles)}個, laser: {len(snapshot.laser_points)}点)')
 
-        # 描画してパブリッシュ
-        self.latest_overlay = self.render_overlay()
-        self.publish_image()
+        self.latest_overlay = self.renderer.render(self.map_image.image, self.snapshot_history)
+        self._publish_overlay()
 
-    # ------------------------------------------------------------------
-    def compute_best_pose_world(self, particle_msg):
-        """ParticleCloud または PoseArray から重み付き平均(world座標)を計算する"""
-        sum_w = sum_x = sum_y = sum_sin = sum_cos = 0.0
+    def _build_snapshot(self, particle_msg: ParticleMsg) -> Snapshot:
+        pose_px = PoseEstimator.best_pose_pixel(particle_msg, self.map_image)
 
-        if isinstance(particle_msg, ParticleCloud):
-            # ParticleCloud型: 重みが設定されている
-            for particle in particle_msg.particles:
-                w = particle.weight
-                sum_w += w
-                sum_x += w * particle.pose.position.x
-                sum_y += w * particle.pose.position.y
-                yaw = self.quaternion_to_yaw(particle.pose.orientation)
-                sum_sin += w * math.sin(yaw)
-                sum_cos += w * math.cos(yaw)
-        else:
-            # PoseArray型: 重みは均等(1.0)
-            for pose in particle_msg.poses:
-                w = 1.0
-                sum_w += w
-                sum_x += w * pose.position.x
-                sum_y += w * pose.position.y
-                yaw = self.quaternion_to_yaw(pose.orientation)
-                sum_sin += w * math.sin(yaw)
-                sum_cos += w * math.cos(yaw)
+        particles: List[WeightedPixel] = []
+        if self.params.show_particles:
+            particles = PoseEstimator.particle_pixels(particle_msg, self.map_image)
 
-        if sum_w <= 0.0:
-            return None
+        laser_points: List[Pixel] = []
+        if (self.params.show_laser_scan
+                and self.latest_scan_msg is not None
+                and pose_px is not None):
+            best_pose_world = PoseEstimator.best_pose_world(particle_msg)
+            if best_pose_world is not None:
+                laser_points = ScanProjector.project(
+                    self.latest_scan_msg, best_pose_world, self.map_image)
 
-        return (sum_x / sum_w, sum_y / sum_w, math.atan2(sum_sin, sum_cos))
+        return Snapshot(pose=pose_px, particles=particles, laser_points=laser_points)
 
-    # ------------------------------------------------------------------
-    def compute_best_pose_pixel(self, particle_msg):
-        """ParticleCloud または PoseArray から重み付き平均をピクセル座標で返す。(px, py, yaw) or None"""
-        world = self.compute_best_pose_world(particle_msg)
-        if world is None:
-            return None
-
-        mean_x, mean_y, mean_yaw = world
-        bpx, bpy = self.world_to_pixel(mean_x, mean_y)
-        if 0 <= bpx < self.map_info.width and 0 <= bpy < self.map_info.height:
-            return (bpx, bpy, mean_yaw)
-        return None
-
-    # ------------------------------------------------------------------
-    def compute_particles_pixels(self, particle_msg):
-        """ParticleCloud または PoseArray の全パーティクルをピクセル座標に変換する"""
-        particles = []
-
-        if isinstance(particle_msg, ParticleCloud):
-            # ParticleCloud型
-            for particle in particle_msg.particles:
-                x = particle.pose.position.x
-                y = particle.pose.position.y
-                px, py = self.world_to_pixel(x, y)
-                if 0 <= px < self.map_info.width and 0 <= py < self.map_info.height:
-                    particles.append((px, py, particle.weight))
-        else:
-            # PoseArray型: 重みは均等に設定
-            weight = 1.0 / len(particle_msg.poses) if len(particle_msg.poses) > 0 else 1.0
-            for pose in particle_msg.poses:
-                x = pose.position.x
-                y = pose.position.y
-                px, py = self.world_to_pixel(x, y)
-                if 0 <= px < self.map_info.width and 0 <= py < self.map_info.height:
-                    particles.append((px, py, weight))
-        
-        return particles
-
-    # ------------------------------------------------------------------
-    def transform_scan_to_pixels(self, scan_msg: LaserScan, robot_pose_world):
-        """自己位置(world座標)を基準にレーザー点群をmap座標系のピクセル点に変換する"""
-        robot_x, robot_y, robot_yaw = robot_pose_world
-        cos_yaw = math.cos(robot_yaw)
-        sin_yaw = math.sin(robot_yaw)
-
-        points = []
-        angle = scan_msg.angle_min
-        for r in scan_msg.ranges:
-            if r < scan_msg.range_min or r > scan_msg.range_max or not math.isfinite(r):
-                angle += scan_msg.angle_increment
-                continue
-
-            lx = r * math.cos(angle)
-            ly = r * math.sin(angle)
-
-            wx = robot_x + lx * cos_yaw - ly * sin_yaw
-            wy = robot_y + lx * sin_yaw + ly * cos_yaw
-
-            px, py = self.world_to_pixel(wx, wy)
-            if 0 <= px < self.map_info.width and 0 <= py < self.map_info.height:
-                points.append((px, py))
-
-            angle += scan_msg.angle_increment
-
-        return points
-
-    # ------------------------------------------------------------------
-    def world_to_pixel(self, x, y):
-        """world座標(map frame) -> 画像座標(px, py) に変換"""
-        info = self.map_info
-        res = info.resolution
-        ox = info.origin.position.x
-        oy = info.origin.position.y
-
-        px = int((x - ox) / res)
-        py = info.height - 1 - int((y - oy) / res)  # flipud分のy軸反転
-        return px, py
-
-    # ------------------------------------------------------------------
-    def render_overlay(self):
-        """スナップショット履歴を古い順(赤)→新しい順(緑)でマップに重ねて描画する。
-        show_* パラメータで表示要素をコントロールする。"""
-        overlay = self.base_map_img.copy()
-        n = len(self.snapshot_history)
-        if n == 0:
-            return overlay
-
-        for i, snapshot in enumerate(self.snapshot_history):
-            # t: 0.0(最古=赤) ~ 1.0(最新=緑)
-            t = i / (n - 1) if n > 1 else 1.0
-            color = self.get_color(t)
-
-            # パーティクルを描画（重みの大きさで透明度を変動させる）
-            if self.show_particles:
-                for (px, py, weight) in snapshot['particles']:
-                    # 重みが小さいと薄く表示
-                    radius = max(1, int(self.particle_radius * (0.5 + weight)))
-                    cv2.circle(overlay, (px, py), radius, color, 1)
-
-            # レーザー点群を描画（★変更箇所：最新の1つだけ描画する）
-            if self.show_laser_scan and i == n - 1:
-                for (px, py) in snapshot['laser_points']:
-                    cv2.circle(overlay, (px, py), self.laser_point_radius, color, -1)
-
-            # 自己位置の代表点を描画（最前面）
-            if self.show_best_pose and snapshot['pose'] is not None:
-                bpx, bpy, yaw = snapshot['pose']
-                self.draw_best_pose(overlay, bpx, bpy, yaw, t)
-
-        return overlay
-
-    # ------------------------------------------------------------------
-    def draw_best_pose(self, img, px, py, yaw, t):
-        """自己位置の代表点を赤(古)→緑(新)グラデーション+矢印で描画する。
-        新しいほど半径を大きくして視覚的に最前面であることを強調する。"""
-        color = self.get_color(t)
-        r = max(1, int(self.best_pose_radius * (0.4 + 0.6 * t)))
-
-        cv2.circle(img, (px, py), r, (0, 0, 0), 2)   # 縁取り
-        cv2.circle(img, (px, py), r, color, -1)
-
-        # 向き矢印(flipud分のy軸反転を反映)
-        length = r * 3
-        ex = int(px + length * math.cos(yaw))
-        ey = int(py - length * math.sin(yaw))
-        cv2.arrowedLine(img, (px, py), (ex, ey), (0, 0, 0), 2, tipLength=0.4)
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def get_color(t):
-        """t(0=最古~1=最新)に応じて Jet グラデーション(青→シアン→緑→黄→赤)の色を返す(BGR)。
-        OpenCVのHSV変換を使い、H=120(青)→H=0(赤) で均一な明度を保つ。"""
-        t = max(0.0, min(1.0, t))
-        hue = int(120 * (1.0 - t))           # 古: 120(青) → 新: 0(赤)
-        hsv = np.uint8([[[hue, 255, 220]]])   # S=255(鮮やか), V=220(白地でも潰れない明度)
-        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0][0]
-        return (int(bgr[0]), int(bgr[1]), int(bgr[2]))
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def quaternion_to_yaw(q):
-        """geometry_msgs/Quaternion -> yaw角[rad]"""
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        return math.atan2(siny_cosp, cosy_cosp)
-
-    # ------------------------------------------------------------------
-    def publish_image(self):
-        """latest_overlay を /vlm_context_image にパブリッシュする"""
+    def _publish_overlay(self) -> None:
         if self.latest_overlay is None:
             return
 
-        out_msg = self.cv_bridge.cv2_to_imgmsg(self.latest_overlay, encoding="bgr8")
+        out_msg = self.cv_bridge.cv2_to_imgmsg(self.latest_overlay, encoding='bgr8')
         out_msg.header.stamp = self.get_clock().now().to_msg()
-        out_msg.header.frame_id = self.map_frame_id
+        out_msg.header.frame_id = self.map_image.frame_id
         self.image_pub.publish(out_msg)
         self.get_logger().info('画像パブリッシュ')
 
     # ------------------------------------------------------------------
-    def save_overlay_callback(self, request, response):
-        """サービスコール: カスタムsrvで受け取った引数を元に画像を保存、またはタイマーを起動する"""
+    # 保存サービス
+    # ------------------------------------------------------------------
+    def _on_save_overlay_request(self, request, response):
         num_images = request.num_images if request.num_images > 0 else 1
         interval = float(request.interval_sec)
 
-        # 枚数が1枚、または周期が指定されていない(0秒以下)の場合は即座に1枚保存して終了
         if num_images == 1 or interval <= 0.0:
-            success, msg = self.save_single_image()
+            success, message = self._save_single_image()
             response.success = success
-            response.message = msg
+            response.message = message
             return response
 
-        # 複数枚保存の処理（すでにタイマーが動いている場合はキャンセル）
-        if self.continuous_save_timer is not None:
-            self.continuous_save_timer.cancel()
-            self.get_logger().info("以前の保存処理をキャンセルして新しい保存を開始します。")
+        self._cancel_continuous_save_timer(log_cancel=True)
+        self._images_to_save = num_images
 
-        self.images_to_save = num_images
-        
-        # 初回の1枚目を即座に保存
-        self.save_single_image()
-        self.images_to_save -= 1
+        self._save_single_image()
+        self._images_to_save -= 1
 
-        # 残りの枚数を指定周期で保存するためのタイマーをセット
-        if self.images_to_save > 0:
-            self.continuous_save_timer = self.create_timer(interval, self.timer_save_callback)
+        if self._images_to_save > 0:
+            self._continuous_save_timer = self.create_timer(
+                interval, self._on_continuous_save_timer)
 
         response.success = True
-        response.message = f"{interval}秒ごとに合計{num_images}枚の画像保存を開始しました。"
+        response.message = f'{interval}秒ごとに合計{num_images}枚の画像保存を開始しました。'
         return response
 
-    # ------------------------------------------------------------------
-    def timer_save_callback(self):
-        """タイマーによって周期的に呼ばれるコールバック"""
-        if self.images_to_save > 0:
-            self.save_single_image()
-            self.images_to_save -= 1
+    def _on_continuous_save_timer(self) -> None:
+        if self._images_to_save > 0:
+            self._save_single_image()
+            self._images_to_save -= 1
 
-        # 指定枚数の保存が完了したらタイマーを停止・破棄
-        if self.images_to_save <= 0:
-            if self.continuous_save_timer is not None:
-                self.continuous_save_timer.cancel()
-                self.continuous_save_timer = None
-            self.get_logger().info("指定された全画像の連続保存が完了しました。")
+        if self._images_to_save <= 0:
+            self._cancel_continuous_save_timer(log_cancel=False)
+            self.get_logger().info('指定された全画像の連続保存が完了しました。')
 
-    # ------------------------------------------------------------------
-    def save_single_image(self):
+    def _cancel_continuous_save_timer(self, log_cancel: bool) -> None:
+        if self._continuous_save_timer is not None:
+            self._continuous_save_timer.cancel()
+            self._continuous_save_timer = None
+            if log_cancel:
+                self.get_logger().info('以前の保存処理をキャンセルして新しい保存を開始します。')
+
+    def _save_single_image(self) -> Tuple[bool, str]:
         """1枚の画像をタイムスタンプ付きで保存し、成否とメッセージを返す"""
         if self.latest_overlay is None:
-            msg = 'No overlay image available'
-            self.get_logger().warn('画像未生成のため保存をスキップ')
-            return False, msg
+            self.get_logger().warn('オーバーレイ画像未生成のため保存をスキップ')
 
-        try:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-            filename = f'/tmp/overlay_{timestamp}.png'
-            cv2.imwrite(filename, self.latest_overlay)
-            self.get_logger().info(f'画像を保存: {filename}')
-            return True, f'Image saved to {filename}'
-        except Exception as e:
-            msg = f'Error saving image: {e}'
-            self.get_logger().error(f'画像保存エラー: {e}')
-            return False, msg
+        camera_img = None
+        if self.latest_camera_msg is not None:
+            camera_img = self.cv_bridge.imgmsg_to_cv2(
+                self.latest_camera_msg, desired_encoding='bgr8')
+        else:
+            self.get_logger().warn('カメラ画像未受信のため、オーバーレイ画像のみ保存しました')
+
+        success, message = self.saver.save(self.latest_overlay, camera_img)
+        if success:
+            self.get_logger().info(message)
+        else:
+            self.get_logger().error(message)
+        return success, message
 
 
-def main(args=None):
+def main(args=None) -> None:
     rclpy.init(args=args)
     node = Superposition()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
