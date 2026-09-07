@@ -110,9 +110,19 @@ ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage
 
 ```
 
-保存先: `/tmp/overlay_YYYYMMDD_HHMMSS_mmm.png`
+保存先: `/tmp`
 
----
+#### 保存される2種類の画像
+ 
+1回の保存につき、同じタイムスタンプを持つ以下の2枚のPNG画像が `/tmp` に保存されます。
+ 
+| ファイル名 | 内容 | 元トピック |
+| --- | --- | --- |
+| `{timestamp}_overlay.png` | マップに自己位置・パーティクル・LiDAR点群を重畳した俯瞰画像 | `/map`, `/particle_cloud`(または`/particles`), `/scan` から生成 |
+| `{timestamp}_perspective.png` | 保存時点で最後に受信したロボット搭載カメラの画像（一人称視点） | `/camera/color/image_raw` |
+ 
+- `{timestamp}` は `YYYY_MMDD_HHMM` 形式（例: `2026_0906_1350`）で、同じ保存タイミングの2枚には同一の値が使われます。
+- 保存時にカメラ画像を一度も受信していない場合は `overlay.png` のみが保存され、`perspective.png` は生成されません。
 
 ## サブスクライブ
 
