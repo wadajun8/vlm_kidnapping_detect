@@ -20,7 +20,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, List, Optional, Sequence, Tuple, Union
+from typing import Deque, List, Optional, Sequence, Set, Tuple, Union
 
 import cv2
 import numpy as np
@@ -57,6 +57,11 @@ OCC_UNKNOWN = -1
 COLOR_FREE: BGRColor = (255, 255, 255)
 COLOR_OCCUPIED: BGRColor = (0, 0, 0)
 COLOR_UNKNOWN: BGRColor = (200, 200, 200)
+
+# レーザースキャンはパーティクルと区別するため固定色で描画する。
+# パーティクルの時系列カラーは 青->シアン->緑->黄->赤 の色相を使うため、
+# そこに含まれないマゼンタを既定色にしている。
+COLOR_LASER: BGRColor = (255, 0, 255)  # BGR: マゼンタ
 
 
 def quaternion_to_yaw(q: Quaternion) -> float:
@@ -209,6 +214,7 @@ class RenderConfig:
     particle_radius: int = 2
     best_pose_radius: int = 4
     laser_point_radius: int = 1
+    laser_color: BGRColor = COLOR_LASER
 
 
 class OverlayRenderer:
@@ -232,7 +238,7 @@ class OverlayRenderer:
                 self._draw_particles(overlay, snap.particles, color)
 
             if self.config.show_laser_scan and is_latest:
-                self._draw_laser_points(overlay, snap.laser_points, color)
+                self._draw_laser_points(overlay, snap.laser_points, self.config.laser_color)
 
             if self.config.show_best_pose and snap.pose is not None:
                 self._draw_best_pose(overlay, snap.pose, t)
@@ -240,9 +246,26 @@ class OverlayRenderer:
         return overlay
 
     def _draw_particles(self, img: np.ndarray, particles: Sequence[WeightedPixel], color: BGRColor) -> None:
-        for px, py, weight in particles:
-            radius = max(1, int(self.config.particle_radius * (0.5 + weight)))
-            cv2.circle(img, (px, py), radius, color, 1)
+        """particle_time_series_node.py方式:円の輪郭ではなく、
+        パーティクル位置の画素をベクトル演算で直接上書きする。
+        重み(weight)は座標抽出時に無視され、点の大きさには反映しない。"""
+        if not particles:
+            return
+
+        points = np.array([(px, py) for px, py, _weight in particles], dtype=np.int32)
+        px_arr = points[:, 0]
+        py_arr = points[:, 1]
+
+        valid = (
+            (px_arr >= 0)
+            & (py_arr >= 0)
+            & (px_arr < img.shape[1])
+            & (py_arr < img.shape[0])
+        )
+        if not np.any(valid):
+            return
+
+        img[py_arr[valid], px_arr[valid]] = color
 
     def _draw_laser_points(self, img: np.ndarray, points: Sequence[Pixel], color: BGRColor) -> None:
         for px, py in points:
@@ -285,7 +308,7 @@ class ImageSaver:
         if overlay is None:
             return False, 'No overlay image available'
 
-        timestamp = datetime.now().strftime('%Y_%m%d_%H%M')  # 2026_0906_1350 の形式
+        timestamp = datetime.now().strftime('%Y_%m%d_%H%M%S')  # 2026_0906_135042 の形式
         try:
             overlay_path = self.output_dir / f'{timestamp}_overlay.png'
             cv2.imwrite(str(overlay_path), overlay)
@@ -313,6 +336,7 @@ class NodeParams:
     particle_radius: int = 2
     best_pose_radius: int = 4
     laser_point_radius: int = 1
+    laser_point_color: List[int] = field(default_factory=lambda: list(COLOR_LASER))
 
 
 class Superposition(Node):
@@ -328,6 +352,7 @@ class Superposition(Node):
             particle_radius=self.params.particle_radius,
             best_pose_radius=self.params.best_pose_radius,
             laser_point_radius=self.params.laser_point_radius,
+            laser_color=self._laser_color(),
         ))
         self.saver = ImageSaver('/tmp')
         self.cv_bridge = CvBridge()
@@ -337,6 +362,9 @@ class Superposition(Node):
         self.latest_scan_msg: Optional[LaserScan] = None
         self.latest_camera_msg: Optional[Image] = None
         self.latest_overlay: Optional[np.ndarray] = None
+
+        # --- 初回ログ済みのイベント(トピック受信・パブリッシュ開始) ---
+        self._logged_events: Set[str] = set()
 
         # --- スナップショット履歴 ---
         self.snapshot_history: Deque[Snapshot] = deque(maxlen=self.params.snapshot_count)
@@ -368,6 +396,28 @@ class Superposition(Node):
             self.declare_parameter(name, default)
         values = {name: self.get_parameter(name).value for name in vars(defaults)}
         return NodeParams(**values)
+
+    def _laser_color(self) -> BGRColor:
+        """laser_point_colorパラメータ(BGR)を検証してタプルへ変換する"""
+        raw = self.params.laser_point_color
+        try:
+            channels = [int(c) for c in raw]
+        except (TypeError, ValueError):
+            channels = []
+
+        if len(channels) != 3 or any(c < 0 or c > 255 for c in channels):
+            self.get_logger().warn(
+                f'laser_point_colorが不正です({raw})。既定値{COLOR_LASER}を使用します')
+            return COLOR_LASER
+
+        return channels[0], channels[1], channels[2]
+
+    def _log_once(self, key: str, message: str) -> None:
+        """key毎に最初の1回だけINFOを出す(以降は無出力)"""
+        if key in self._logged_events:
+            return
+        self._logged_events.add(key)
+        self.get_logger().info(message)
 
     def _init_subscriptions_and_services(self) -> None:
         map_qos = QoSProfile(
@@ -403,38 +453,41 @@ class Superposition(Node):
     # 購読コールバック
     # ------------------------------------------------------------------
     def _on_map(self, msg: OccupancyGrid) -> None:
-        self.get_logger().info('マップ受信')
+        self._log_once('map', 'マップ受信 (/map)')
         self.map_image.update(msg)
 
     def _on_particles(self, msg: ParticleMsg) -> None:
         if isinstance(msg, PoseArray) and len(msg.poses) == 0:
             self.latest_particle_msg = None
             return
+        self._log_once(
+            'particles', f'パーティクル受信 ({self.params.particle_topic})')
         self.latest_particle_msg = msg
 
     def _on_scan(self, msg: LaserScan) -> None:
+        self._log_once('scan', 'スキャン受信 (/scan)')
         self.latest_scan_msg = msg
 
     def _on_camera(self, msg: Image) -> None:
+        self._log_once(
+            'camera', 'カメラ画像受信 (/camera/color/image_raw)')
         self.latest_camera_msg = msg
 
     # ------------------------------------------------------------------
     # キャプチャ・描画・配信
     # ------------------------------------------------------------------
     def _on_capture_timer(self) -> None:
+        # キャプチャはcapture_interval_sec毎に走るため、警告は間引いて出力する
         if not self.map_image.ready:
-            self.get_logger().warn('マップ未受信のためキャプチャをスキップ')
+            self.get_logger().warn(
+                'マップ未受信のためキャプチャをスキップ', throttle_duration_sec=5.0)
             return
         if self.latest_particle_msg is None:
-            self.get_logger().warn('パーティクル未受信のためキャプチャをスキップ')
+            self.get_logger().warn(
+                'パーティクル未受信のためキャプチャをスキップ', throttle_duration_sec=5.0)
             return
 
-        snapshot = self._build_snapshot(self.latest_particle_msg)
-        self.snapshot_history.append(snapshot)
-
-        self.get_logger().info(
-            f'キャプチャ #{len(self.snapshot_history)}/{self.params.snapshot_count} '
-            f'(particles: {len(snapshot.particles)}個, laser: {len(snapshot.laser_points)}点)')
+        self.snapshot_history.append(self._build_snapshot(self.latest_particle_msg))
 
         self.latest_overlay = self.renderer.render(self.map_image.image, self.snapshot_history)
         self._publish_overlay()
@@ -465,7 +518,7 @@ class Superposition(Node):
         out_msg.header.stamp = self.get_clock().now().to_msg()
         out_msg.header.frame_id = self.map_image.frame_id
         self.image_pub.publish(out_msg)
-        self.get_logger().info('画像パブリッシュ')
+        self._log_once('publish', '重畳画像のパブリッシュ開始 (/vlm_context_image)')
 
     # ------------------------------------------------------------------
     # 保存サービス
@@ -473,6 +526,9 @@ class Superposition(Node):
     def _on_save_overlay_request(self, request, response):
         num_images = request.num_images if request.num_images > 0 else 1
         interval = float(request.interval_sec)
+
+        self.get_logger().info(
+            f'保存要求を受信 (num_images={num_images}, interval_sec={interval})')
 
         if num_images == 1 or interval <= 0.0:
             success, message = self._save_single_image()

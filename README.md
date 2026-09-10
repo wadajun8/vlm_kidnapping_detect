@@ -79,6 +79,24 @@ ros2 run vlm_kidnapping_detect superposition \
 
 ```
 
+### LiDAR点群の色
+
+LiDAR点群はパーティクルと区別するため、世代カラーではなく固定色で描画されます。
+デフォルトはマゼンタ `(255, 0, 255)` です（パーティクルの世代カラーが使う色相
+青→シアン→緑→黄→赤 に含まれないため）。
+
+`laser_point_color` パラメータに **BGR順** の整数配列を渡すと変更できます:
+
+```bash
+# LiDAR点群を黄色にする
+ros2 run vlm_kidnapping_detect superposition \
+  --ros-args \
+  -p laser_point_color:="[0, 255, 255]"
+
+```
+
+要素数が3でない、または0〜255の範囲外の値を含む場合は警告を出してデフォルト色に戻ります。
+
 **EMCL + パーティクル非表示の例:**
 
 ```bash
@@ -121,7 +139,8 @@ ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage
 | `{timestamp}_overlay.png` | マップに自己位置・パーティクル・LiDAR点群を重畳した俯瞰画像 | `/map`, `/particle_cloud`(または`/particles`), `/scan` から生成 |
 | `{timestamp}_perspective.png` | 保存時点で最後に受信したロボット搭載カメラの画像（一人称視点） | `/camera/color/image_raw` |
  
-- `{timestamp}` は `YYYY_MMDD_HHMM` 形式（例: `2026_0906_1350`）で、同じ保存タイミングの2枚には同一の値が使われます。
+- `{timestamp}` は `YYYY_MMDD_HHMMSS` 形式（例: `2026_0906_135042`）で、同じ保存タイミングの2枚には同一の値が使われます。
+- 秒単位までしか持たないため、`interval_sec` を1秒未満にすると同じファイル名になり上書きされます。
 - 保存時にカメラ画像を一度も受信していない場合は `overlay.png` のみが保存され、`perspective.png` は生成されません。
 
 ## サブスクライブ
@@ -154,9 +173,10 @@ ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage
 | `show_particles` | bool | `True` | パーティクルを描画するか |
 | `show_laser_scan` | bool | `True` | LiDAR点群を描画するか |
 | `show_best_pose` | bool | `True` | 自己位置マーカーを描画するか |
-| `particle_radius` | int | `2` | パーティクルの描画半径 [px] |
+| `particle_radius` | int | `2` | （現在未使用。パーティクルは1画素で描画される） |
 | `best_pose_radius` | int | `4` | 自己位置マーカーの基準半径 [px] |
 | `laser_point_radius` | int | `1` | LiDAR点群の描画半径 [px] |
+| `laser_point_color` | int[] | `[255, 0, 255]` | LiDAR点群の描画色（**BGR順**、各0〜255） |
 
 ### サービス
 
@@ -168,8 +188,9 @@ ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage
 
 * **Jetグラデーション**: 青(古) → シアン → 緑 → 黄 → 赤(新)で世代を色分け
 * **描画順序**: 古い→新しい順で描画し、新しいものが最前面に表示される
-* **パーティクル**: 円で描画、重みが大きいほど半径が大きくなる
-* **LiDAR点群**: 最新の1世代分（現在時刻のもの）のみを小さな円で描画
+* **パーティクル**: 1画素ずつ直接描画。重み(weight)は点の大きさ・色には反映されない
+* **LiDAR点群**: 最新の1世代分（現在時刻のもの）のみを小さな円で描画。
+  パーティクルと区別するため世代カラーではなく `laser_point_color` の固定色を使う
 * **自己位置マーカー**: LiDAR点群より前面に表示。新しいものほど半径が大きく、向きを矢印で表示
 
 ### 依存パッケージ（主なもの）
