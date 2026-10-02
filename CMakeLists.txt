@@ -15,9 +15,25 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 
 # ノード（実行ファイル）のインストール
 install(PROGRAMS
-  vlm_kidnapping_detect/map_scan_superposition.py
+  vlm_kidnapping_detect/superposition/map_scan_superposition.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME superposition
+)
+
+install(PROGRAMS
+  vlm_kidnapping_detect/camera_server/camera_server_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME camera_server
+)
+
+# launchファイル
+install(DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/launch
+)
+
+# パラメータファイル
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
 )
 
 # リソースファイルのインストール

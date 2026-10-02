@@ -20,7 +20,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, List, Optional, Sequence, Set, Tuple, Union
+from typing import Deque, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -30,6 +30,7 @@ from geometry_msgs.msg import PoseArray, Quaternion
 from nav2_msgs.msg import ParticleCloud
 from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from rclpy.qos import (
     QoSDurabilityPolicy,
     QoSProfile,
@@ -324,9 +325,38 @@ class ImageSaver:
             return False, f'Error saving images: {e}'
 
 
+class StateLogger:
+    """key毎に直前の状態を覚え、状態が変化した時だけログを出す"""
+
+    _UNSET = object()
+
+    def __init__(self, logger) -> None:
+        self._logger = logger
+        self._states: dict = {}
+
+    def get(self, key: str):
+        return self._states.get(key)
+
+    def update(self, key: str, state, message: str, level: str = 'info') -> bool:
+        """状態が前回と異なればlevelでmessageを出力し、Trueを返す"""
+        if self._states.get(key, self._UNSET) == state:
+            return False
+        self._states[key] = state
+        # rclpyは同じ呼び出し行で重要度を変えると例外になるため、重要度毎に行を分ける
+        if level == 'error':
+            self._logger.error(message)
+        elif level == 'warn':
+            self._logger.warn(message)
+        else:
+            self._logger.info(message)
+        return True
+
+
 @dataclass
 class NodeParams:
     capture_interval_sec: float = 1.0
+    # この秒数以上受信が無ければ途絶とみなす(0以下で無効)
+    topic_timeout_sec: float = 3.0
     snapshot_count: int = 5
     particle_topic: str = '/particle_cloud'
     particle_msg_type: str = 'ParticleCloud'
@@ -363,8 +393,21 @@ class Superposition(Node):
         self.latest_camera_msg: Optional[Image] = None
         self.latest_overlay: Optional[np.ndarray] = None
 
-        # --- 初回ログ済みのイベント(トピック受信・パブリッシュ開始) ---
-        self._logged_events: Set[str] = set()
+        # --- 状態変化時のみログを出すためのロガー ---
+        self.state_log = StateLogger(self.get_logger())
+
+        # --- 購読トピック毎の最終受信時刻(途絶検知用) ---
+        self._last_received: dict = {}
+
+        # --- 一度でもパブリッシュしたか(「開始」と「再開」のログを出し分ける) ---
+        self._has_published = False
+
+        # --- 監視する購読トピックと、ログに出す配信元の名前 ---
+        self._topic_sources = {
+            self.params.particle_topic: 'AMCL',
+            '/scan': 'LiDAR',
+            '/camera/color/image_raw': 'カメラサーバ',
+        }
 
         # --- スナップショット履歴 ---
         self.snapshot_history: Deque[Snapshot] = deque(maxlen=self.params.snapshot_count)
@@ -377,11 +420,18 @@ class Superposition(Node):
 
         self.capture_timer = self.create_timer(
             self.params.capture_interval_sec, self._on_capture_timer)
+        self.monitor_timer = self.create_timer(1.0, self._on_monitor_timer)
 
+        interval = self.params.capture_interval_sec
+        self.get_logger().info(
+            f'{interval}秒ごと、'
+            f'直近{self.params.snapshot_count}個の重畳画像を、'
+            f'{interval}秒ごとに /vlm_context_image へパブリッシュ')
         self.get_logger().info(
             f'起動 (particle_topic={self.params.particle_topic}, '
             f'particle_msg_type={self.params.particle_msg_type}, '
             f'capture_interval={self.params.capture_interval_sec}s, '
+            f'topic_timeout={self.params.topic_timeout_sec}s, '
             f'snapshot_count={self.params.snapshot_count}, '
             f'show_particles={self.params.show_particles}, '
             f'show_laser_scan={self.params.show_laser_scan}, '
@@ -411,13 +461,6 @@ class Superposition(Node):
             return COLOR_LASER
 
         return channels[0], channels[1], channels[2]
-
-    def _log_once(self, key: str, message: str) -> None:
-        """key毎に最初の1回だけINFOを出す(以降は無出力)"""
-        if key in self._logged_events:
-            return
-        self._logged_events.add(key)
-        self.get_logger().info(message)
 
     def _init_subscriptions_and_services(self) -> None:
         map_qos = QoSProfile(
@@ -453,44 +496,131 @@ class Superposition(Node):
     # 購読コールバック
     # ------------------------------------------------------------------
     def _on_map(self, msg: OccupancyGrid) -> None:
-        self._log_once('map', 'マップ受信 (/map)')
+        info = msg.info
+        # 定期的に再配信されても、地図の中身(サイズ・解像度・原点)が変わった時だけログを出す
+        self.state_log.update(
+            'map',
+            (info.width, info.height, info.resolution,
+             info.origin.position.x, info.origin.position.y),
+            f'マップ受信 (/map, {info.width}x{info.height}, '
+            f'resolution={info.resolution:.3f})')
         self.map_image.update(msg)
 
     def _on_particles(self, msg: ParticleMsg) -> None:
-        if isinstance(msg, PoseArray) and len(msg.poses) == 0:
-            self.latest_particle_msg = None
-            return
-        self._log_once(
-            'particles', f'パーティクル受信 ({self.params.particle_topic})')
-        self.latest_particle_msg = msg
+        self._mark_received(self.params.particle_topic)
+        empty = isinstance(msg, PoseArray) and len(msg.poses) == 0
+        self.state_log.update(
+            'particles_empty', empty,
+            f'パーティクルが空です ({self.params.particle_topic})' if empty
+            else f'パーティクル受信 ({self.params.particle_topic})',
+            level='warn' if empty else 'info')
+        self.latest_particle_msg = None if empty else msg
 
     def _on_scan(self, msg: LaserScan) -> None:
-        self._log_once('scan', 'スキャン受信 (/scan)')
+        self._mark_received('/scan')
         self.latest_scan_msg = msg
 
     def _on_camera(self, msg: Image) -> None:
-        self._log_once(
-            'camera', 'カメラ画像受信 (/camera/color/image_raw)')
+        self._mark_received('/camera/color/image_raw')
         self.latest_camera_msg = msg
+
+    # ------------------------------------------------------------------
+    # 接続・受信状態の監視
+    # ------------------------------------------------------------------
+    def _mark_received(self, topic: str) -> None:
+        """受信時刻を記録し、未受信/途絶からの復帰時だけログを出す"""
+        self._last_received[topic] = self.get_clock().now()
+        source = self._topic_sources[topic]
+        prev = self.state_log.get(f'recv:{topic}')
+        self.state_log.update(
+            f'recv:{topic}', 'receiving',
+            f'{source}からの受信再開 ({topic})' if prev == 'timeout'
+            else f'{source}から受信開始 ({topic})')
+
+    def _on_monitor_timer(self) -> None:
+        # 購読トピック: publisherの有無で接続/切断を判定
+        for topic, source in self._topic_sources.items():
+            connected = self.count_publishers(topic) > 0
+            prev = self.state_log.get(f'conn:{topic}')
+            if connected:
+                message = f'{source}と接続 ({topic} の購読開始)'
+            elif prev:
+                message = f'{source}との接続が切れました ({topic} のpublisherが消えました)'
+            else:
+                message = f'{source}と未接続 ({topic} のpublisherがいません)'
+            self.state_log.update(
+                f'conn:{topic}', connected, message,
+                level='info' if connected else 'warn')
+            self._check_timeout(topic)
+
+        # 配信トピック: subscriberの有無
+        has_sub = self.image_pub.get_subscription_count() > 0
+        self.state_log.update(
+            'conn:/vlm_context_image', has_sub,
+            '/vlm_context_image の購読者が接続しました' if has_sub
+            else '/vlm_context_image の購読者はいません')
+
+    def _check_timeout(self, topic: str) -> None:
+        # AMCLは静止中パーティクルを配信しないため、パーティクルは途絶判定の対象外
+        if topic == self.params.particle_topic:
+            return
+        timeout = self.params.topic_timeout_sec
+        last = self._last_received.get(topic)
+        if timeout <= 0.0 or last is None:
+            return
+        elapsed = (self.get_clock().now() - last).nanoseconds * 1e-9
+        if elapsed >= timeout:
+            self.state_log.update(
+                f'recv:{topic}', 'timeout',
+                f'{self._topic_sources[topic]}からの受信途絶 '
+                f'({topic}, {timeout:.1f}秒以上受信なし)', level='warn')
 
     # ------------------------------------------------------------------
     # キャプチャ・描画・配信
     # ------------------------------------------------------------------
     def _on_capture_timer(self) -> None:
-        # キャプチャはcapture_interval_sec毎に走るため、警告は間引いて出力する
+        # キャプチャはcapture_interval_sec毎に走るため、状態が変わった時だけログを出す
         if not self.map_image.ready:
-            self.get_logger().warn(
-                'マップ未受信のためキャプチャをスキップ', throttle_duration_sec=5.0)
+            self.state_log.update(
+                'capture', 'no_map', 'マップ未受信のためキャプチャを待機中', level='warn')
             return
         if self.latest_particle_msg is None:
-            self.get_logger().warn(
-                'パーティクル未受信のためキャプチャをスキップ', throttle_duration_sec=5.0)
+            self.state_log.update(
+                'capture', 'no_particle', 'パーティクル未受信のためキャプチャを待機中', level='warn')
             return
 
-        self.snapshot_history.append(self._build_snapshot(self.latest_particle_msg))
+        try:
+            snapshot = self._build_snapshot(self.latest_particle_msg)
+            self.snapshot_history.append(snapshot)
 
-        self.latest_overlay = self.renderer.render(self.map_image.image, self.snapshot_history)
-        self._publish_overlay()
+            # snapshot_count枚たまるまでは描画・パブリッシュしない
+            if len(self.snapshot_history) < self.params.snapshot_count:
+                self.state_log.update(
+                    'capture', 'collecting',
+                    f'スナップショット収集中 ({self.params.snapshot_count}枚たまったらパブリッシュ開始)')
+                return
+
+            self.latest_overlay = self.renderer.render(self.map_image.image, self.snapshot_history)
+            self._publish_overlay()
+        except Exception as e:  # 同じエラーが続いても1回だけ出す
+            self.state_log.update(
+                'capture', ('error', str(e)), f'重畳画像の生成・配信に失敗: {e}', level='error')
+            return
+
+        self.state_log.update(
+            'capture', 'publishing',
+            '重畳画像のパブリッシュ再開 (/vlm_context_image)' if self._has_published
+            else '重畳画像のパブリッシュ開始 (/vlm_context_image)')
+        self._has_published = True
+
+        in_map = snapshot.pose is not None
+        if in_map:
+            in_map_message = ('推定姿勢は地図内です' if self.state_log.get('pose_in_map') is None
+                              else '推定姿勢が地図内に戻りました')
+        self.state_log.update(
+            'pose_in_map', in_map,
+            in_map_message if in_map else '推定姿勢が地図の範囲外です',
+            level='info' if in_map else 'warn')
 
     def _build_snapshot(self, particle_msg: ParticleMsg) -> Snapshot:
         pose_px = PoseEstimator.best_pose_pixel(particle_msg, self.map_image)
@@ -518,7 +648,6 @@ class Superposition(Node):
         out_msg.header.stamp = self.get_clock().now().to_msg()
         out_msg.header.frame_id = self.map_image.frame_id
         self.image_pub.publish(out_msg)
-        self._log_once('publish', '重畳画像のパブリッシュ開始 (/vlm_context_image)')
 
     # ------------------------------------------------------------------
     # 保存サービス
@@ -571,12 +700,23 @@ class Superposition(Node):
         if self.latest_overlay is None:
             self.get_logger().warn('オーバーレイ画像未生成のため保存をスキップ')
 
+        # 連続保存中に毎枚同じ警告が出ないよう、カメラ画像の有無は変化時のみログを出す
         camera_img = None
         if self.latest_camera_msg is not None:
-            camera_img = self.cv_bridge.imgmsg_to_cv2(
-                self.latest_camera_msg, desired_encoding='bgr8')
+            try:
+                camera_img = self.cv_bridge.imgmsg_to_cv2(
+                    self.latest_camera_msg, desired_encoding='bgr8')
+                self.state_log.update(
+                    'save_camera', 'ok', '保存: カメラ画像も保存します')
+            except Exception as e:
+                self.state_log.update(
+                    'save_camera', ('error', str(e)),
+                    f'カメラ画像の変換に失敗したため、オーバーレイ画像のみ保存します: {e}',
+                    level='error')
         else:
-            self.get_logger().warn('カメラ画像未受信のため、オーバーレイ画像のみ保存しました')
+            self.state_log.update(
+                'save_camera', 'missing',
+                'カメラ画像未受信のため、オーバーレイ画像のみ保存します', level='warn')
 
         success, message = self.saver.save(self.latest_overlay, camera_img)
         if success:
@@ -587,13 +727,19 @@ class Superposition(Node):
 
 
 def main(args=None) -> None:
-    rclpy.init(args=args)
+    # rclpyのSIGINTハンドラはcontextを先に閉じてしまい「終了」ログを出せないため無効化し、
+    # KeyboardInterruptで抜けてからshutdownする
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = Superposition()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
+        node.get_logger().info('終了')
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

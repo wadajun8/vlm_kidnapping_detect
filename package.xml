@@ -7,14 +7,21 @@
   <maintainer email="junya.wada.27@gmail.com">junya</maintainer>
   <license>BSD-3-Clause</license>
 
+  <depend>rclpy</depend>
+
   <depend>nav2_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>std_srvs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>cv_bridge</depend>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>ament_cmake_python</buildtool_depend>
   <buildtool_depend>rosidl_default_generators</buildtool_depend>
   <exec_depend>rosidl_default_runtime</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
   <member_of_group>rosidl_interface_packages</member_of_group>
 
   <test_depend>ament_copyright</test_depend>

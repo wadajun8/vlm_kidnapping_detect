@@ -1,0 +1,27 @@
+# superposition ノードのパラメータ
+# image_collection.launch.py から読み込まれる。
+# 変更後は colcon build で install 先へ反映すること（--symlink-install なら不要）
+#
+# 注意: 型はノード側の既定値に合わせる（double は 1 ではなく 1.0 と書く）
+
+superposition_node:  # launch で付けているノード名と一致させる
+  ros__parameters:
+    # --- キャプチャ・配信 ---
+    capture_interval_sec: 1.0   # スナップショット取得間隔 [秒]
+    snapshot_count: 5           # 重ねる世代数
+    topic_timeout_sec: 3.0      # この秒数以上受信が無ければ受信途絶とみなす [秒]（0以下で無効）
+
+    # --- パーティクル ---
+    # AMCL: /particle_cloud + ParticleCloud
+    # EMCL: パーティクルのトピック名 + PoseArray
+    particle_topic: /particle_cloud
+    particle_msg_type: ParticleCloud
+
+    # --- 描画 ---
+    show_particles: true
+    show_laser_scan: true
+    show_best_pose: true
+    particle_radius: 2          # 現在未使用（パーティクルは1画素で描画）
+    best_pose_radius: 4         # 自己位置マーカーの基準半径 [px]
+    laser_point_radius: 1       # LiDAR点群の描画半径 [px]
+    laser_point_color: [255, 0, 255]  # LiDAR点群の色（BGR順、各0〜255）

@@ -1,14 +1,48 @@
 # vlm_kidnapping_detect
 
 VLMを用いて誘拐ロボット問題を検知するROS2パッケージ。
-現時点では、マップ・自己位置・LiDARを重畳した画像のパブリッシュと、カスタムサービスを利用した画像の連続保存機能が実装されています。
+現時点では以下の機能が実装されています。
+
+- マップ・自己位置・LiDARを重畳した画像のパブリッシュ（`superposition`）
+- USBカメラ画像のパブリッシュ（`camera_server`）
+- カスタムサービスを利用した重畳画像・カメラ画像の連続保存
+
+## ノード一覧
+
+| 実行ファイル名 | ノード名（`ros2 run` / launch） | 役割 |
+| --- | --- | --- |
+| `superposition` | `superposition` / `superposition_node` | 地図・パーティクル・LiDARを重畳した画像を配信し、保存サービスを提供 |
+| `camera_server` | `camera_publisher` / `camera_server_node` | USBカメラの画像を `/camera/color/image_raw` へ配信 |
 
 ## クイックスタート
 
 ```bash
 colcon build --packages-select vlm_kidnapping_detect
 source install/setup.bash
+
+# superposition と camera_server を同時に起動
+ros2 launch vlm_kidnapping_detect image_collection.launch.py
+
+```
+
+launch 時の superposition のパラメータは `config/superposition.yaml` で設定します。
+YAML を編集したら `colcon build` で install 先へ反映してください（`--symlink-install` でビルドしている場合は不要）。
+
+```yaml
+superposition_node:  # launch で付けているノード名と一致させる
+  ros__parameters:
+    capture_interval_sec: 1.0   # double は 1 ではなく 1.0 と書く
+    snapshot_count: 5
+    particle_topic: /particle_cloud
+    particle_msg_type: ParticleCloud
+    ...
+```
+
+ノードを個別に起動する場合:
+
+```bash
 ros2 run vlm_kidnapping_detect superposition
+ros2 run vlm_kidnapping_detect camera_server
 
 ```
 
@@ -143,7 +177,63 @@ ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage
 - 秒単位までしか持たないため、`interval_sec` を1秒未満にすると同じファイル名になり上書きされます。
 - 保存時にカメラ画像を一度も受信していない場合は `overlay.png` のみが保存され、`perspective.png` は生成されません。
 
-## サブスクライブ
+## ログ出力
+
+両ノードとも、同じログを周期的に出し続けるのではなく、**状態が変化したタイミングで1回だけ**ログを出します。
+同じエラーが続いても1回しか表示されないため、切断や復帰に気付きやすくなっています。
+
+### superposition
+
+起動時に動作の説明とパラメータを表示します:
+
+```
+[INFO] 1.0秒ごと、直近5個の重畳画像を、1.0秒ごとに /vlm_context_image へパブリッシュ
+[INFO] 起動 (particle_topic=/particle_cloud, particle_msg_type=ParticleCloud, capture_interval=1.0s, topic_timeout=3.0s, snapshot_count=5, ...)
+```
+
+その後は以下のタイミングでログが出ます（`{配信元}` は AMCL / LiDAR / カメラサーバ）。
+
+| タイミング | レベル | ログ例 |
+| --- | --- | --- |
+| 起動時にpublisherがいない | WARN | `カメラサーバと未接続 (/camera/color/image_raw のpublisherがいません)` |
+| publisherを検出 | INFO | `カメラサーバと接続 (/camera/color/image_raw の購読開始)` |
+| publisherが消えた | WARN | `カメラサーバとの接続が切れました (/camera/color/image_raw のpublisherが消えました)` |
+| 初回受信 | INFO | `{配信元}から受信開始 ({トピック})` |
+| `topic_timeout_sec` 以上受信なし | WARN | `{配信元}からの受信途絶 ({トピック}, 3.0秒以上受信なし)` |
+| 途絶から復帰 | INFO | `{配信元}からの受信再開 ({トピック})` |
+| マップ受信（サイズ・解像度・原点が変わった時のみ） | INFO | `マップ受信 (/map, 100x100, resolution=0.050)` |
+| マップ／パーティクル待ち | WARN | `マップ未受信のためキャプチャを待機中` |
+| `snapshot_count` 枚たまるまで | INFO | `スナップショット収集中 (5枚たまったらパブリッシュ開始)` |
+| パブリッシュ開始・再開 | INFO | `重畳画像のパブリッシュ開始 (/vlm_context_image)` |
+| 画像生成・配信で例外 | ERROR | `重畳画像の生成・配信に失敗: ...` |
+| 推定姿勢が地図外へ出た／戻った | WARN / INFO | `推定姿勢が地図の範囲外です` / `推定姿勢が地図内に戻りました` |
+| `/vlm_context_image` の購読者の有無が変化 | INFO | `/vlm_context_image の購読者が接続しました` |
+| 保存サービスの受信 | INFO | `保存要求を受信 (num_images=3, interval_sec=0.5)` |
+| 保存時のカメラ画像の有無が変化 | INFO / WARN | `カメラ画像未受信のため、オーバーレイ画像のみ保存します` |
+| 終了 | INFO | `終了` |
+
+- 接続状態（publisherの有無）は1秒ごとに確認します。
+- AMCLはロボット静止中にパーティクルを配信しないため、パーティクルトピックは受信途絶の判定対象外です（切断はpublisherの有無で検知します）。
+- 保存サービスでは、保存したファイルパスは1枚ごとに表示されます。
+
+### camera_server
+
+| タイミング | レベル | ログ |
+| --- | --- | --- |
+| 起動 | INFO | `カメラサーバを起動しました` |
+| カメラと接続した（再接続を含む） | INFO | `カメラと接続しました` |
+| カメラを開けない／途中で切断された | ERROR | `カメラと接続できません！接続を確認してください。` |
+
+切断中は1秒ごとに再接続を試み、つながると自動で配信を再開します。
+再接続を試すたびにOpenCVが出す警告は抑制しています（`OPENCV_LOG_LEVEL=ERROR`）。
+
+## camera_server
+
+USBカメラ（V4L2）の画像を 10Hz で `/camera/color/image_raw`（bgr8）へ配信します。
+使用するデバイス番号はパラメータではなく、`camera_server_node.py` の `self.camera_index`（デフォルト `0` = `/dev/video0`）で指定します。
+接続されているデバイスは `ls /dev/video*` で確認できます。
+
+## サブスクライブ（superposition）
 
 | トピック | 型 | QoS | 説明 |
 | --- | --- | --- | --- |
@@ -151,23 +241,26 @@ ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage
 | `/particle_cloud` (デフォルト) | `nav2_msgs/msg/ParticleCloud` | BEST_EFFORT / VOLATILE | AMCLパーティクル群 |
 | `/particles` (EMCL時) | `geometry_msgs/msg/PoseArray` | BEST_EFFORT / VOLATILE | EMCLパーティクル群 |
 | `/scan` | `sensor_msgs/msg/LaserScan` | BEST_EFFORT (sensor_data) | LiDARスキャン |
+| `/camera/color/image_raw` | `sensor_msgs/msg/Image` | BEST_EFFORT (sensor_data) | カメラ画像（保存時の `perspective.png` に使用） |
 
 ※ パーティクルトピック名はパラメータで変更可能
 
 ## パブリッシュ
 
-| トピック | 型 | 説明 |
-| --- | --- | --- |
-| `/vlm_context_image` | `sensor_msgs/msg/Image` | 重畳画像(bgr8) |
+| ノード | トピック | 型 | 説明 |
+| --- | --- | --- | --- |
+| `superposition` | `/vlm_context_image` | `sensor_msgs/msg/Image` | 重畳画像(bgr8) |
+| `camera_server` | `/camera/color/image_raw` | `sensor_msgs/msg/Image` | カメラ画像(bgr8, 10Hz) |
 
 ## その他
 
-### パラメータ
+### パラメータ（superposition）
 
 | パラメータ名 | 型 | デフォルト | 説明 |
 | --- | --- | --- | --- |
 | `capture_interval_sec` | double | `1.0` | スナップショット取得間隔 [秒] |
-| `snapshot_count` | int | `5` | 重ねる世代数 |
+| `topic_timeout_sec` | double | `3.0` | この秒数以上受信が無ければ受信途絶とみなす [秒]（0以下で無効） |
+| `snapshot_count` | int | `5` | 重ねる世代数（この枚数たまるまでパブリッシュしない） |
 | `particle_topic` | string | `/particle_cloud` | パーティクルトピック名 |
 | `particle_msg_type` | string | `ParticleCloud` | パーティクルメッセージ型 (`ParticleCloud` または `PoseArray`) |
 | `show_particles` | bool | `True` | パーティクルを描画するか |
@@ -196,8 +289,12 @@ ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage
 ### 依存パッケージ（主なもの）
 
 ```xml
+<depend>rclpy</depend>
 <depend>nav2_msgs</depend>
 <depend>geometry_msgs</depend>
+<depend>sensor_msgs</depend>
+<depend>nav_msgs</depend>
+<depend>cv_bridge</depend>
 <buildtool_depend>ament_cmake</buildtool_depend>
 <buildtool_depend>ament_cmake_python</buildtool_depend>
 <buildtool_depend>rosidl_default_generators</buildtool_depend>
