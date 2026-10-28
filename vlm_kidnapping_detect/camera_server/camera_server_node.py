@@ -2,99 +2,105 @@
 # SPDX-FileCopyrightText: 2026 Junya Wada
 # SPDX-License-Identifier: BSD-3-Clause
 
+"""USBカメラの画像を /camera/color/image_raw へ配信するノード"""
+
 import os
 
-# 再接続のたびにOpenCVが出すWARNを抑える（cv2のimportより前に設定する必要がある）
 os.environ.setdefault('OPENCV_LOG_LEVEL', 'ERROR')
 
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
-import cv2
+from typing import Optional  # noqa: E402
 
-class CameraPublisher(Node):
-    def __init__(self):
-        super().__init__('camera_publisher')
-        
-        # 画像を配信するパブリッシャーを作成
-        self.publisher_ = self.create_publisher(Image, '/camera/color/image_raw', 10)
-        
-        # 1秒間に何回画像を配信するか（例：10Hz = 0.1秒ごと）
-        timer_period = 0.1  
-        self.timer = self.create_timer(timer_period, self.timer_callback)
-        
-        # OpenCVとROS 2の画像形式を変換するブリッジ
+import cv2  # noqa: E402
+from cv_bridge import CvBridge  # noqa: E402
+import rclpy  # noqa: E402
+from rclpy.node import Node  # noqa: E402
+from sensor_msgs.msg import Image  # noqa: E402
+
+
+class CameraServer(Node):
+    """カメラから画像を取得して配信する。切断時は一定間隔で再接続を試みる"""
+
+    def __init__(self) -> None:
+        super().__init__('camera_server')
+
+        # 使用するカメラは config/camera_server.yaml の video_device で指定する
+        self.video_device: str = self.declare_parameter('video_device', '/dev/video0').value
+        self.frame_id: str = self.declare_parameter('frame_id', 'camera_link').value
+        publish_rate: float = self.declare_parameter('publish_rate', 10.0).value
+        self.reconnect_interval: float = self.declare_parameter(
+            'reconnect_interval_sec', 1.0).value
+
+        self.publisher = self.create_publisher(Image, '/camera/color/image_raw', 10)
         self.bridge = CvBridge()
-        
-        self.get_logger().info('カメラサーバを起動しました')
 
-        # カメラの起動（適宜番号変えてくださいな）
-        self.camera_index = 0
-        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
+        self.cap: Optional[cv2.VideoCapture] = None
+        # 接続状態（None: 未判定）。状態が変わった時だけログを出す
+        self.connected: Optional[bool] = None
+        self.last_open_time = self.get_clock().now()
 
-        # 接続状態（None: 未判定, True: 接続中, False: 切断中）。状態が変わった時だけログを出す
-        self.connected = None
+        self.get_logger().info(
+            f'カメラサーバを起動しました (video_device={self.video_device}, '
+            f'publish_rate={publish_rate}Hz)')
+        self._open()
+        self.timer = self.create_timer(1.0 / publish_rate, self._on_timer)
 
-        # 切断中に再接続を試みる間隔[秒]
-        self.reconnect_interval = 1.0
-        self.last_reconnect_time = self.get_clock().now()
+    def _open(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
+        self.last_open_time = self.get_clock().now()
+        self.cap = cv2.VideoCapture(self.video_device, cv2.CAP_V4L2)
+        self._set_connected(self.cap.isOpened())
 
-        self.update_connection_state(self.cap.isOpened())
-
-    def update_connection_state(self, connected):
+    def _set_connected(self, connected: bool) -> None:
         if connected == self.connected:
             return
         self.connected = connected
         if connected:
-            self.get_logger().info('カメラと接続しました')
+            self.get_logger().info(f'カメラと接続しました ({self.video_device})')
         else:
-            self.get_logger().error('カメラと接続できません！接続を確認してください。')
+            self.get_logger().error(
+                f'カメラと接続できません ({self.video_device})。'
+                f'接続とvideo_deviceパラメータを確認してください')
 
-    def try_reconnect(self):
-        now = self.get_clock().now()
-        if (now - self.last_reconnect_time).nanoseconds < self.reconnect_interval * 1e9:
-            return
-        self.last_reconnect_time = now
-        self.cap.release()
-        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
-
-    def timer_callback(self):
+    def _on_timer(self) -> None:
         if not self.connected:
-            self.try_reconnect()
-            if not self.cap.isOpened():
+            elapsed = (self.get_clock().now() - self.last_open_time).nanoseconds * 1e-9
+            if elapsed < self.reconnect_interval:
+                return
+            self._open()
+            if not self.connected:
                 return
 
-        ret, frame = self.cap.read()
-        self.update_connection_state(ret)
+        ok, frame = self.cap.read()
+        self._set_connected(ok)
+        if not ok:
+            return
 
-        if ret:
-            # 💡 VLAのVRAM(4GB)節約のために、ここで事前に小さくリサイズしてパブリッシュするのもアリです！
-            # frame = cv2.resize(frame, (224, 224)) 
-            
-            # OpenCVの画像(ndarray)をROS 2のImageメッセージに変換
-            msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
-            
-            # 配信！
-            self.publisher_.publish(msg)
+        # VLMのVRAM節約が必要なら、ここで事前にリサイズしてから配信してもよい
+        # frame = cv2.resize(frame, (224, 224))
+        msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.frame_id
+        self.publisher.publish(msg)
 
-    def destroy_node(self):
-        # ノード終了時にカメラをしっかり解放する
-        self.cap.release()
+    def destroy_node(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
         super().destroy_node()
 
-def main(args=None):
+
+def main(args=None) -> None:
     rclpy.init(args=args)
-    camera_publisher = CameraPublisher()
-    
+    node = CameraServer()
     try:
-        rclpy.spin(camera_publisher)
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        camera_publisher.destroy_node()
+        node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()

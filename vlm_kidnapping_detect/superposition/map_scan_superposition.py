@@ -31,6 +31,7 @@ from nav2_msgs.msg import ParticleCloud
 from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
+from rclpy.time import Time
 from rclpy.qos import (
     QoSDurabilityPolicy,
     QoSProfile,
@@ -64,6 +65,9 @@ COLOR_UNKNOWN: BGRColor = (200, 200, 200)
 # そこに含まれないマゼンタを既定色にしている。
 COLOR_LASER: BGRColor = (255, 0, 255)  # BGR: マゼンタ
 
+# 重畳画像と対応付けるため保持するカメラ画像の枚数(10Hzで約3秒分)
+CAMERA_BUFFER_SIZE = 30
+
 
 def quaternion_to_yaw(q: Quaternion) -> float:
     """クォータニオンからYaw角を取り出す"""
@@ -79,6 +83,15 @@ class Snapshot:
     pose: Optional[PosePixel]
     particles: List[WeightedPixel] = field(default_factory=list)
     laser_points: List[Pixel] = field(default_factory=list)
+
+
+@dataclass
+class Capture:
+    """同時刻とみなせる重畳画像とカメラ画像の組"""
+    overlay: np.ndarray
+    stamp: Time                     # 重畳画像の時刻(使用したスキャンの時刻)
+    camera_msg: Optional[Image]     # stampに最も近いカメラ画像(許容差を超えればNone)
+    camera_time_diff: Optional[float]  # カメラ画像の時刻 - stamp [秒]
 
 
 class MapImage:
@@ -305,11 +318,15 @@ class ImageSaver:
         self,
         overlay: Optional[np.ndarray],
         camera_img: Optional[np.ndarray],
+        stamp: Optional[Time] = None,
     ) -> Tuple[bool, str]:
         if overlay is None:
             return False, 'No overlay image available'
 
-        timestamp = datetime.now().strftime('%Y_%m%d_%H%M%S')  # 2026_0906_135042 の形式
+        # 2026_0906_135042_123 の形式(ミリ秒まで付けて連続保存時の上書きを防ぐ)
+        when = (datetime.fromtimestamp(stamp.nanoseconds * 1e-9) if stamp is not None
+                else datetime.now())
+        timestamp = when.strftime('%Y_%m%d_%H%M%S_%f')[:-3]
         try:
             overlay_path = self.output_dir / f'{timestamp}_overlay.png'
             cv2.imwrite(str(overlay_path), overlay)
@@ -367,6 +384,8 @@ class NodeParams:
     best_pose_radius: int = 4
     laser_point_radius: int = 1
     laser_point_color: List[int] = field(default_factory=lambda: list(COLOR_LASER))
+    # 重畳画像との時刻差がこれ以下のカメラ画像だけを組にして保存する [秒]
+    camera_sync_tolerance_sec: float = 0.2
 
 
 class Superposition(Node):
@@ -390,8 +409,8 @@ class Superposition(Node):
         # --- 最新メッセージのキャッシュ ---
         self.latest_particle_msg: Optional[ParticleMsg] = None
         self.latest_scan_msg: Optional[LaserScan] = None
-        self.latest_camera_msg: Optional[Image] = None
-        self.latest_overlay: Optional[np.ndarray] = None
+        self.camera_buffer: Deque[Image] = deque(maxlen=CAMERA_BUFFER_SIZE)
+        self.latest_capture: Optional[Capture] = None
 
         # --- 状態変化時のみログを出すためのロガー ---
         self.state_log = StateLogger(self.get_logger())
@@ -402,11 +421,11 @@ class Superposition(Node):
         # --- 一度でもパブリッシュしたか(「開始」と「再開」のログを出し分ける) ---
         self._has_published = False
 
-        # --- 監視する購読トピックと、ログに出す配信元の名前 ---
+        # --- 監視する購読トピックと、ログに出すデータの名前 ---
         self._topic_sources = {
-            self.params.particle_topic: 'AMCL',
-            '/scan': 'LiDAR',
-            '/camera/color/image_raw': 'カメラサーバ',
+            self.params.particle_topic: 'パーティクル',
+            '/scan': 'LiDARスキャン',
+            '/camera/color/image_raw': 'カメラ画像',
         }
 
         # --- スナップショット履歴 ---
@@ -522,10 +541,10 @@ class Superposition(Node):
 
     def _on_camera(self, msg: Image) -> None:
         self._mark_received('/camera/color/image_raw')
-        self.latest_camera_msg = msg
+        self.camera_buffer.append(msg)
 
     # ------------------------------------------------------------------
-    # 接続・受信状態の監視
+    # publisherの有無・受信状態の監視
     # ------------------------------------------------------------------
     def _mark_received(self, topic: str) -> None:
         """受信時刻を記録し、未受信/途絶からの復帰時だけログを出す"""
@@ -534,31 +553,27 @@ class Superposition(Node):
         prev = self.state_log.get(f'recv:{topic}')
         self.state_log.update(
             f'recv:{topic}', 'receiving',
-            f'{source}からの受信再開 ({topic})' if prev == 'timeout'
-            else f'{source}から受信開始 ({topic})')
+            f'{source}の受信再開 ({topic})' if prev == 'timeout'
+            else f'{source}の受信開始 ({topic})')
 
     def _on_monitor_timer(self) -> None:
-        # 購読トピック: publisherの有無で接続/切断を判定
+        # 購読トピック: publisherの有無の変化をログに出す
         for topic, source in self._topic_sources.items():
-            connected = self.count_publishers(topic) > 0
-            prev = self.state_log.get(f'conn:{topic}')
-            if connected:
-                message = f'{source}と接続 ({topic} の購読開始)'
+            # パーティクルはpublisherの有無を通知しない(途絶判定も対象外)
+            if topic == self.params.particle_topic:
+                continue
+            has_pub = self.count_publishers(topic) > 0
+            prev = self.state_log.get(f'pub:{topic}')
+            if has_pub:
+                message = f'{source}のpublisherを検出 ({topic})'
             elif prev:
-                message = f'{source}との接続が切れました ({topic} のpublisherが消えました)'
+                message = f'{source}のpublisherがいなくなりました ({topic})'
             else:
-                message = f'{source}と未接続 ({topic} のpublisherがいません)'
+                message = f'{source}のpublisherがいません ({topic})'
             self.state_log.update(
-                f'conn:{topic}', connected, message,
-                level='info' if connected else 'warn')
+                f'pub:{topic}', has_pub, message,
+                level='info' if has_pub else 'warn')
             self._check_timeout(topic)
-
-        # 配信トピック: subscriberの有無
-        has_sub = self.image_pub.get_subscription_count() > 0
-        self.state_log.update(
-            'conn:/vlm_context_image', has_sub,
-            '/vlm_context_image の購読者が接続しました' if has_sub
-            else '/vlm_context_image の購読者はいません')
 
     def _check_timeout(self, topic: str) -> None:
         # AMCLは静止中パーティクルを配信しないため、パーティクルは途絶判定の対象外
@@ -572,7 +587,7 @@ class Superposition(Node):
         if elapsed >= timeout:
             self.state_log.update(
                 f'recv:{topic}', 'timeout',
-                f'{self._topic_sources[topic]}からの受信途絶 '
+                f'{self._topic_sources[topic]}の受信途絶 '
                 f'({topic}, {timeout:.1f}秒以上受信なし)', level='warn')
 
     # ------------------------------------------------------------------
@@ -600,7 +615,10 @@ class Superposition(Node):
                     f'スナップショット収集中 ({self.params.snapshot_count}枚たまったらパブリッシュ開始)')
                 return
 
-            self.latest_overlay = self.renderer.render(self.map_image.image, self.snapshot_history)
+            overlay = self.renderer.render(self.map_image.image, self.snapshot_history)
+            stamp = self._capture_stamp()
+            camera_msg, camera_time_diff = self._find_camera_msg(stamp)
+            self.latest_capture = Capture(overlay, stamp, camera_msg, camera_time_diff)
             self._publish_overlay()
         except Exception as e:  # 同じエラーが続いても1回だけ出す
             self.state_log.update(
@@ -640,12 +658,30 @@ class Superposition(Node):
 
         return Snapshot(pose=pose_px, particles=particles, laser_points=laser_points)
 
+    def _capture_stamp(self) -> Time:
+        """重畳画像の時刻。描画に使ったスキャンの時刻とし、無ければ現在時刻"""
+        if self.params.show_laser_scan and self.latest_scan_msg is not None:
+            return Time.from_msg(self.latest_scan_msg.header.stamp)
+        return self.get_clock().now()
+
+    def _find_camera_msg(self, stamp: Time) -> Tuple[Optional[Image], Optional[float]]:
+        """stampに最も近いカメラ画像と時刻差[秒]を返す。許容差を超えればNone"""
+        if not self.camera_buffer:
+            return None, None
+        msg = min(
+            self.camera_buffer,
+            key=lambda m: abs((Time.from_msg(m.header.stamp) - stamp).nanoseconds))
+        diff = (Time.from_msg(msg.header.stamp) - stamp).nanoseconds * 1e-9
+        if abs(diff) > self.params.camera_sync_tolerance_sec:
+            return None, diff
+        return msg, diff
+
     def _publish_overlay(self) -> None:
-        if self.latest_overlay is None:
+        if self.latest_capture is None:
             return
 
-        out_msg = self.cv_bridge.cv2_to_imgmsg(self.latest_overlay, encoding='bgr8')
-        out_msg.header.stamp = self.get_clock().now().to_msg()
+        out_msg = self.cv_bridge.cv2_to_imgmsg(self.latest_capture.overlay, encoding='bgr8')
+        out_msg.header.stamp = self.latest_capture.stamp.to_msg()
         out_msg.header.frame_id = self.map_image.frame_id
         self.image_pub.publish(out_msg)
 
@@ -696,29 +732,39 @@ class Superposition(Node):
                 self.get_logger().info('以前の保存処理をキャンセルして新しい保存を開始します。')
 
     def _save_single_image(self) -> Tuple[bool, str]:
-        """1枚の画像をタイムスタンプ付きで保存し、成否とメッセージを返す"""
-        if self.latest_overlay is None:
+        """最新の重畳画像と、同時刻のカメラ画像を組で保存し、成否とメッセージを返す"""
+        capture = self.latest_capture
+        if capture is None:
             self.get_logger().warn('オーバーレイ画像未生成のため保存をスキップ')
+            return self.saver.save(None, None)
 
         # 連続保存中に毎枚同じ警告が出ないよう、カメラ画像の有無は変化時のみログを出す
         camera_img = None
-        if self.latest_camera_msg is not None:
+        tolerance = self.params.camera_sync_tolerance_sec
+        if capture.camera_msg is not None:
             try:
                 camera_img = self.cv_bridge.imgmsg_to_cv2(
-                    self.latest_camera_msg, desired_encoding='bgr8')
+                    capture.camera_msg, desired_encoding='bgr8')
                 self.state_log.update(
-                    'save_camera', 'ok', '保存: カメラ画像も保存します')
+                    'save_camera', 'ok', '保存: 同時刻のカメラ画像も保存します')
             except Exception as e:
                 self.state_log.update(
                     'save_camera', ('error', str(e)),
                     f'カメラ画像の変換に失敗したため、オーバーレイ画像のみ保存します: {e}',
                     level='error')
+        elif capture.camera_time_diff is not None:
+            self.state_log.update(
+                'save_camera', 'out_of_sync',
+                f'重畳画像と{tolerance}秒以内のカメラ画像が無いため、オーバーレイ画像のみ保存します '
+                f'(最も近い画像の時刻差 {capture.camera_time_diff:+.3f}秒)', level='warn')
         else:
             self.state_log.update(
                 'save_camera', 'missing',
                 'カメラ画像未受信のため、オーバーレイ画像のみ保存します', level='warn')
 
-        success, message = self.saver.save(self.latest_overlay, camera_img)
+        success, message = self.saver.save(capture.overlay, camera_img, capture.stamp)
+        if success and camera_img is not None:
+            message += f' (時刻差 {capture.camera_time_diff:+.3f}秒)'
         if success:
             self.get_logger().info(message)
         else:

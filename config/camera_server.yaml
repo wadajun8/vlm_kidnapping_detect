@@ -1,0 +1,22 @@
+# camera_server ノードのパラメータ
+# image_collection.launch.py から読み込まれる。
+# 変更後は colcon build で install 先へ反映すること（--symlink-install なら不要）
+#
+# 注意: 型はノード側の既定値に合わせる（double は 10 ではなく 10.0 と書く）
+
+camera_server_node:  # launch で付けているノード名と一致させる
+  ros__parameters:
+    # --- カメラデバイス ---
+    # 映像用のV4L2デバイスを指定する。確認方法:
+    #   v4l2-ctl --list-devices            # カメラ毎のデバイス一覧
+    #   v4l2-ctl -d /dev/videoN --all      # Device Caps が "Video Capture" なら映像用
+    # UVCカメラは1台で /dev/videoN を2つ作り、片方はメタデータ専用で映像は取れない。
+    # /dev/videoN の番号は抜き差しで変わり得るので、/dev/v4l/by-id/ 以下の
+    # "...-video-index0" を指定するとカメラを固定できる
+    video_device: /dev/video0
+    # video_device: /dev/v4l/by-id/usb-Azurewave_USB2.0_HD_UVC_WebCam_0x0001-video-index0
+
+    # --- 配信 ---
+    publish_rate: 10.0            # 配信周期 [Hz]
+    frame_id: camera_link         # 画像の header.frame_id
+    reconnect_interval_sec: 1.0   # 切断中に再接続を試みる間隔 [秒]

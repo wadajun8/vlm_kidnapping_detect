@@ -171,11 +171,12 @@ ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage
 | ファイル名 | 内容 | 元トピック |
 | --- | --- | --- |
 | `{timestamp}_overlay.png` | マップに自己位置・パーティクル・LiDAR点群を重畳した俯瞰画像 | `/map`, `/particle_cloud`(または`/particles`), `/scan` から生成 |
-| `{timestamp}_perspective.png` | 保存時点で最後に受信したロボット搭載カメラの画像（一人称視点） | `/camera/color/image_raw` |
+| `{timestamp}_perspective.png` | 重畳画像と同時刻（スキャンの時刻に最も近い、`camera_sync_tolerance_sec` 以内）のロボット搭載カメラの画像（一人称視点） | `/camera/color/image_raw` |
  
-- `{timestamp}` は `YYYY_MMDD_HHMMSS` 形式（例: `2026_0906_135042`）で、同じ保存タイミングの2枚には同一の値が使われます。
-- 秒単位までしか持たないため、`interval_sec` を1秒未満にすると同じファイル名になり上書きされます。
-- 保存時にカメラ画像を一度も受信していない場合は `overlay.png` のみが保存され、`perspective.png` は生成されません。
+- `{timestamp}` は重畳画像の時刻（描画に使ったスキャンの時刻）を `YYYY_MMDD_HHMMSS_mmm` 形式（例: `2026_0906_135042_123`）にしたもので、組になる2枚には同一の値が使われます。
+- 重畳画像は `capture_interval_sec` ごとに更新されるため、それより短い `interval_sec` で連続保存すると同じ組が同じファイル名で保存し直されます。
+- 重畳画像と `camera_sync_tolerance_sec` 以内のカメラ画像が無い場合（カメラ未受信・途絶など）は `overlay.png` のみが保存され、`perspective.png` は生成されません。
+- 保存ログに、カメラ画像の時刻 − 重畳画像の時刻（例: `時刻差 +0.031秒`）が出ます。
 
 ## ログ出力
 
@@ -191,28 +192,28 @@ ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage
 [INFO] 起動 (particle_topic=/particle_cloud, particle_msg_type=ParticleCloud, capture_interval=1.0s, topic_timeout=3.0s, snapshot_count=5, ...)
 ```
 
-その後は以下のタイミングでログが出ます（`{配信元}` は AMCL / LiDAR / カメラサーバ）。
+その後は以下のタイミングでログが出ます（`{データ}` は パーティクル / LiDARスキャン / カメラ画像）。
 
 | タイミング | レベル | ログ例 |
 | --- | --- | --- |
-| 起動時にpublisherがいない | WARN | `カメラサーバと未接続 (/camera/color/image_raw のpublisherがいません)` |
-| publisherを検出 | INFO | `カメラサーバと接続 (/camera/color/image_raw の購読開始)` |
-| publisherが消えた | WARN | `カメラサーバとの接続が切れました (/camera/color/image_raw のpublisherが消えました)` |
-| 初回受信 | INFO | `{配信元}から受信開始 ({トピック})` |
-| `topic_timeout_sec` 以上受信なし | WARN | `{配信元}からの受信途絶 ({トピック}, 3.0秒以上受信なし)` |
-| 途絶から復帰 | INFO | `{配信元}からの受信再開 ({トピック})` |
+| 起動時にpublisherがいない | WARN | `カメラ画像のpublisherがいません (/camera/color/image_raw)` |
+| publisherを検出 | INFO | `カメラ画像のpublisherを検出 (/camera/color/image_raw)` |
+| publisherが消えた | WARN | `カメラ画像のpublisherがいなくなりました (/camera/color/image_raw)` |
+| 初回受信 | INFO | `{データ}の受信開始 ({トピック})` |
+| `topic_timeout_sec` 以上受信なし | WARN | `{データ}の受信途絶 ({トピック}, 3.0秒以上受信なし)` |
+| 途絶から復帰 | INFO | `{データ}の受信再開 ({トピック})` |
 | マップ受信（サイズ・解像度・原点が変わった時のみ） | INFO | `マップ受信 (/map, 100x100, resolution=0.050)` |
 | マップ／パーティクル待ち | WARN | `マップ未受信のためキャプチャを待機中` |
 | `snapshot_count` 枚たまるまで | INFO | `スナップショット収集中 (5枚たまったらパブリッシュ開始)` |
 | パブリッシュ開始・再開 | INFO | `重畳画像のパブリッシュ開始 (/vlm_context_image)` |
 | 画像生成・配信で例外 | ERROR | `重畳画像の生成・配信に失敗: ...` |
 | 推定姿勢が地図外へ出た／戻った | WARN / INFO | `推定姿勢が地図の範囲外です` / `推定姿勢が地図内に戻りました` |
-| `/vlm_context_image` の購読者の有無が変化 | INFO | `/vlm_context_image の購読者が接続しました` |
+| `/vlm_context_image` の購読者の有無が変化 | INFO | `/vlm_context_image の購読者を検出` |
 | 保存サービスの受信 | INFO | `保存要求を受信 (num_images=3, interval_sec=0.5)` |
 | 保存時のカメラ画像の有無が変化 | INFO / WARN | `カメラ画像未受信のため、オーバーレイ画像のみ保存します` |
 | 終了 | INFO | `終了` |
 
-- 接続状態（publisherの有無）は1秒ごとに確認します。
+- publisherの有無は1秒ごとに確認します。
 - AMCLはロボット静止中にパーティクルを配信しないため、パーティクルトピックは受信途絶の判定対象外です（切断はpublisherの有無で検知します）。
 - 保存サービスでは、保存したファイルパスは1枚ごとに表示されます。
 

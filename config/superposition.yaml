@@ -10,12 +10,13 @@ superposition_node:  # launch で付けているノード名と一致させる
     capture_interval_sec: 1.0   # スナップショット取得間隔 [秒]
     snapshot_count: 5           # 重ねる世代数
     topic_timeout_sec: 3.0      # この秒数以上受信が無ければ受信途絶とみなす [秒]（0以下で無効）
+    camera_sync_tolerance_sec: 0.2  # 重畳画像（スキャン時刻）との時刻差がこれ以下のカメラ画像だけ保存 [秒]
 
     # --- パーティクル ---
     # AMCL: /particle_cloud + ParticleCloud
     # EMCL: パーティクルのトピック名 + PoseArray
-    particle_topic: /particle_cloud
-    particle_msg_type: ParticleCloud
+    particle_topic: /particlecloud
+    particle_msg_type: PoseArray
 
     # --- 描画 ---
     show_particles: true
