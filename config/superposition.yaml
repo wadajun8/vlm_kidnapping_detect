@@ -21,7 +21,7 @@ superposition_node:  # launch で付けているノード名と一致させる
     # --- 描画 ---
     show_particles: true
     show_laser_scan: true
-    show_best_pose: true
+    show_best_pose: false       # 代表位置(自己位置マーカー)は描かない。最新のLiDAR点群と直近5回分のパーティクルだけ
     particle_radius: 2          # 現在未使用（パーティクルは1画素で描画）
     best_pose_radius: 4         # 自己位置マーカーの基準半径 [px]
     laser_point_radius: 1       # LiDAR点群の描画半径 [px]
