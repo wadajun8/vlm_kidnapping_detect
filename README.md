@@ -177,6 +177,9 @@ ros2 service call /save_overlay_image vlm_kidnapping_detect/srv/SaveOverlayImage
 - 重畳画像は `capture_interval_sec` ごとに更新されるため、それより短い `interval_sec` で連続保存すると同じ組が同じファイル名で保存し直されます。
 - 重畳画像と `camera_sync_tolerance_sec` 以内のカメラ画像が無い場合（カメラ未受信・途絶など）は `overlay.png` のみが保存され、`perspective.png` は生成されません。
 - 保存ログに、カメラ画像の時刻 − 重畳画像の時刻（例: `時刻差 +0.031秒`）が出ます。
+- カメラ画像は重畳画像より遅れて届く（高解像度だと 0.1〜0.3 秒程度）ため、組にするカメラ画像は
+  重畳画像の時刻より後の画像が届くまで確定せず、カメラ画像を受信するたびに選び直します。
+  重畳画像の生成直後に保存した場合は、その時点で最も近い画像が使われます。
 
 ## ログ出力
 

@@ -92,6 +92,8 @@ class Capture:
     stamp: Time                     # 重畳画像の時刻(使用したスキャンの時刻)
     camera_msg: Optional[Image]     # stampに最も近いカメラ画像(許容差を超えればNone)
     camera_time_diff: Optional[float]  # カメラ画像の時刻 - stamp [秒]
+    # stampより後のカメラ画像がまだ届いておらず、より近い画像が来る可能性があるか
+    camera_pending: bool = False
 
 
 class MapImage:
@@ -542,6 +544,8 @@ class Superposition(Node):
     def _on_camera(self, msg: Image) -> None:
         self._mark_received('/camera/color/image_raw')
         self.camera_buffer.append(msg)
+        if self.latest_capture is not None and self.latest_capture.camera_pending:
+            self._resolve_camera(self.latest_capture)
 
     # ------------------------------------------------------------------
     # publisherの有無・受信状態の監視
@@ -617,8 +621,8 @@ class Superposition(Node):
 
             overlay = self.renderer.render(self.map_image.image, self.snapshot_history)
             stamp = self._capture_stamp()
-            camera_msg, camera_time_diff = self._find_camera_msg(stamp)
-            self.latest_capture = Capture(overlay, stamp, camera_msg, camera_time_diff)
+            self.latest_capture = Capture(overlay, stamp, None, None, camera_pending=True)
+            self._resolve_camera(self.latest_capture)
             self._publish_overlay()
         except Exception as e:  # 同じエラーが続いても1回だけ出す
             self.state_log.update(
@@ -663,6 +667,18 @@ class Superposition(Node):
         if self.params.show_laser_scan and self.latest_scan_msg is not None:
             return Time.from_msg(self.latest_scan_msg.header.stamp)
         return self.get_clock().now()
+
+    def _resolve_camera(self, capture: Capture) -> None:
+        """captureに組にするカメラ画像を決める
+
+        カメラ画像は重畳画像より遅れて届くため、重畳画像の時刻の時点ではそれより後の画像が
+        まだ無いことが多い。その時点で選ぶと常に古い側の画像になるので、stampより後の画像が
+        届くまでは決定せず(camera_pending)、カメラ画像を受信するたびに選び直す
+        """
+        capture.camera_msg, capture.camera_time_diff = self._find_camera_msg(capture.stamp)
+        capture.camera_pending = not (
+            self.camera_buffer
+            and Time.from_msg(self.camera_buffer[-1].header.stamp) >= capture.stamp)
 
     def _find_camera_msg(self, stamp: Time) -> Tuple[Optional[Image], Optional[float]]:
         """stampに最も近いカメラ画像と時刻差[秒]を返す。許容差を超えればNone"""
