@@ -1,0 +1,51 @@
+# データセット収集（collect_dataset）の設定
+# 変更後は colcon build で install 先へ反映すること（--symlink-install なら不要）
+# ここの値はそのまま各条件の experiment_conditions.yaml にも記録される
+
+output_root: ~/vlm_kidnapping_dataset   # この下に <YYYY_MMDD>/<localizer>_<mode>/ep_XXX/ を作る
+episodes: 20                            # 1条件あたりのエピソード数
+seed: 20261029                          # 乱数の基準値（エピソード毎に localizer・mode・番号から派生させる）
+
+# Gazebo world 座標 → map 座標の変換（iscas_museum_map は world (0, -2) が map 原点）
+world_to_map: {x: 0.0, y: 2.0, yaw_deg: 0.0}
+robot_entity: raspicat
+
+# --- 1エピソードの時間 [シミュレーション時間 秒] ---
+reset_settle_sec: 1.0      # 開始姿勢へ移動してから初期姿勢を送るまで
+initialpose_settle_sec: 1.0
+warmup_sec: 6.0            # 走行開始後、保存しない時間（重畳画像の履歴 5枚×1秒 にリセット前の軌跡が残るため）
+pre_event_sec: 10.0        # 誘拐前の記録時間
+post_event_sec: 20.0       # 誘拐後の記録時間
+reset_timeout_sec: 20.0    # 開始時に推定が「通常」に収まらなければエピソードを破棄するまでの時間
+
+# --- 走行 ---
+min_clearance_m: 0.5       # 開始姿勢・ゴール・誘拐先は壁からこの距離以上の自由空間から選ぶ
+goal_distance_m: [3.0, 12.0]   # ゴールは現在地からこの距離範囲で選ぶ（到達・失敗したら次のゴールを送る）
+
+# --- ラベル（正解姿勢と推定姿勢の誤差から毎フレーム自動付与） ---
+label:
+  kidnapped: {pos_m: 0.5, yaw_deg: 30.0}   # どちらかを超えたら kidnapped
+  normal: {pos_m: 0.2, yaw_deg: 10.0}      # 両方以下なら normal。その間は ambiguous
+
+# --- 誘拐（teleport: 本体を移動 / initialpose: 本体はそのまま推定だけ移動） ---
+# 種類を一様に選ぶ。量は誘拐直前の正解姿勢からの相対量
+kidnap_types:
+  small: {distance_m: [0.5, 1.5], yaw_deg: [-30.0, 30.0]}      # 車輪の空転・衝突程度
+  large: {min_distance_m: 3.0}                                # 自由空間のランダムな位置・向き
+  rotation: {abs_yaw_deg: [45.0, 180.0]}                      # 位置はそのまま向きだけ
+# /initialpose で送る共分散（初期化時・initialpose 誘拐時とも）
+initialpose_std: {xy_m: 0.1, yaw_deg: 3.0}
+
+# 重畳画像とカメラ画像の対応付けの許容差 [秒]（superposition の camera_sync_tolerance_sec と同じ）
+camera_sync_tolerance_sec: 0.2
+
+# パラメータを ros2 param dump で保存するノード（localizer は自動で追加）
+param_dump_nodes:
+  - /superposition_node
+  - /controller_server
+  - /planner_server
+  - /bt_navigator
+  - /velocity_smoother
+  - /local_costmap/local_costmap
+  - /global_costmap/global_costmap
+  - /map_server
