@@ -20,6 +20,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 set(NODES
   "superposition:vlm_kidnapping_detect/superposition/map_scan_superposition.py"
   "camera_server:vlm_kidnapping_detect/camera_server/camera_server_node.py"
+  "collect_dataset:data_collection/collect_dataset.py"
+  "record_environment:data_collection/record_environment.py"
 )
 foreach(node IN LISTS NODES)
   string(REPLACE ":" ";" node "${node}")
@@ -38,6 +40,14 @@ install(DIRECTORY launch/
 
 # パラメータファイル
 install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
+)
+
+# データセット収集（data_collection/）の launch・パラメータ
+install(DIRECTORY data_collection/launch/
+  DESTINATION share/${PROJECT_NAME}/launch
+)
+install(DIRECTORY data_collection/config/
   DESTINATION share/${PROJECT_NAME}/config
 )
 
