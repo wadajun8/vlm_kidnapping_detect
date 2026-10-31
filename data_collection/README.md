@@ -62,8 +62,10 @@ ros2 run vlm_kidnapping_detect collect_dataset --localizer emcl2 --mode teleport
 
 ## 出力
 
+保存先は `collection.yaml` の `output_root`（既定はこのパッケージの `dataset/`）。容量が大きいため `.gitignore` で除外し、GitHub には上げない。
+
 ```
-~/vlm_kidnapping_dataset/<YYYY_MMDD>/
+~/raspicat2/src/vlm_kidnapping_detect/dataset/<YYYY_MMDD>/
   experiment_environment.yaml / .md    # 実行環境（OS・CPU/GPU・ROS 2・Gazebo・リポジトリのコミット）
   summary_all.yaml / .md               # 全条件の集計表（論文の表に使える形）
   logs/                                # シミュレーションと収集のログ

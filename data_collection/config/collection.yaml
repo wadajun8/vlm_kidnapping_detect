@@ -2,7 +2,7 @@
 # 変更後は colcon build で install 先へ反映すること（--symlink-install なら不要）
 # ここの値はそのまま各条件の experiment_conditions.yaml にも記録される
 
-output_root: ~/vlm_kidnapping_dataset   # この下に <YYYY_MMDD>/<localizer>_<mode>/ep_XXX/ を作る
+output_root: ~/raspicat2/src/vlm_kidnapping_detect/dataset   # この下に <YYYY_MMDD>/<localizer>_<mode>/ep_XXX/ を作る
 episodes: 20                            # 1条件あたりのエピソード数
 seed: 20261029                          # 乱数の基準値（エピソード毎に localizer・mode・番号から派生させる）
 
