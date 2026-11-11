@@ -5,6 +5,7 @@
 #   ./run_all_conditions.bash                 # collection.yaml の episodes 数で全条件
 #   ./run_all_conditions.bash 1               # 各条件1エピソードだけ（動作確認用）
 #   LOCALIZERS=emcl2 MODES="teleport" ./run_all_conditions.bash 5
+#   CONFIG=/path/to/collection_seq.yaml ./run_all_conditions.bash   # 別の設定ファイルを使う
 #
 # localizer ごとにシミュレーション一式（sim_collection.launch.py）を起動し直す。
 # 実行環境・実験条件・集計は record_environment で YAML / Markdown に書き出す。
@@ -15,17 +16,26 @@ EPISODES=${1:-}
 LOCALIZERS=${LOCALIZERS:-"amcl emcl2"}
 MODES=${MODES:-"normal teleport initialpose"}
 DATE=${DATE:-$(date +%Y_%m%d)}
+CONFIG=${CONFIG:-}   # 空なら install 先の config/collection.yaml
 
 if ! ros2 pkg prefix vlm_kidnapping_detect > /dev/null 2>&1; then
     echo "vlm_kidnapping_detect が見つかりません。ワークスペースの install/setup.bash を source してください" >&2
     exit 1
 fi
 
+if [ -z "${CONFIG}" ]; then
+    CONFIG="$(ros2 pkg prefix vlm_kidnapping_detect)/share/vlm_kidnapping_detect/config/collection.yaml"
+fi
+if [ ! -f "${CONFIG}" ]; then
+    echo "設定ファイルが見つかりません: ${CONFIG}" >&2
+    exit 1
+fi
+echo "設定ファイル: ${CONFIG}"
+
 OUTPUT_ROOT=$(python3 -c "
-import yaml, os
-from ament_index_python.packages import get_package_share_directory as d
-cfg = yaml.safe_load(open(os.path.join(d('vlm_kidnapping_detect'), 'config', 'collection.yaml')))
-print(os.path.expanduser(cfg['output_root']))")
+import yaml, os, sys
+cfg = yaml.safe_load(open(sys.argv[1]))
+print(os.path.expanduser(cfg['output_root']))" "${CONFIG}")
 DATE_DIR="${OUTPUT_ROOT}/${DATE}"
 LOG_DIR="${DATE_DIR}/logs"
 mkdir -p "${LOG_DIR}"
@@ -83,7 +93,8 @@ for localizer in ${LOCALIZERS}; do
         condition_dir="${DATE_DIR}/${localizer}_${mode}"
         echo "=== ${localizer}_${mode}: 収集開始"
         ros2 run vlm_kidnapping_detect collect_dataset \
-            --localizer "${localizer}" --mode "${mode}" --date "${DATE}" "${episodes_arg[@]}" \
+            --localizer "${localizer}" --mode "${mode}" --date "${DATE}" --config "${CONFIG}" \
+            "${episodes_arg[@]}" \
             2>&1 | tee -a "${LOG_DIR}/collect_${localizer}_${mode}.log"
         ros2 run vlm_kidnapping_detect record_environment conditions --condition-dir "${condition_dir}"
         ros2 run vlm_kidnapping_detect record_environment summary --condition-dir "${condition_dir}"

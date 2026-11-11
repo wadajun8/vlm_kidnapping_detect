@@ -514,6 +514,17 @@ class ConditionRunner:
             self.node.send_goal(goal)
             self.goals_sent += 1
 
+    def event_schedule(self) -> Tuple[float, float]:
+        """誘拐前・誘拐後の記録時間 [s] を返す。
+        episode_sec と event_time_sec があれば、誘拐の時刻をその範囲から一様に選ぶ（連続判定用）。
+        無ければ pre_event_sec・post_event_sec の固定値（2026/10/29 のデータセットと同じ）。"""
+        cfg = self.cfg
+        if 'episode_sec' in cfg and 'event_time_sec' in cfg:
+            lo, hi = cfg['event_time_sec']
+            pre = self.rng.uniform(float(lo), float(hi))
+            return pre, float(cfg['episode_sec']) - pre
+        return float(cfg['pre_event_sec']), float(cfg['post_event_sec'])
+
     def run_episode(self, index: int) -> dict:
         node, cfg = self.node, self.cfg
         episode_seed = f'{cfg["seed"]}-{self.args.localizer}-{self.args.mode}-{index}'
@@ -559,13 +570,15 @@ class ConditionRunner:
             node.event_time = None
             node.recording = True
         sim_start, wall_start = node.now(), time.monotonic()
-        node.sleep_sim(cfg['pre_event_sec'], during=self.keep_navigating)
+        pre_sec, post_sec = self.event_schedule()
+        node.sleep_sim(pre_sec, during=self.keep_navigating)
 
         # 4. イベント
         gt_before, est_before = node.ground_truth(), node._estimated_pose()
         event = {'t_episode': round((node.now() - node.episode_start).nanoseconds * 1e-9, 3),
                  'gt_before': gt_before.as_dict(),
-                 'est_before': est_before.as_dict() if est_before else None}
+                 'est_before': est_before.as_dict() if est_before else None,
+                 'planned_t_episode': round(pre_sec, 3)}
         if self.args.mode != 'normal':
             kind, target = self.sample_kidnap(gt_before)
             if self.args.mode == 'teleport':
@@ -581,7 +594,7 @@ class ConditionRunner:
         info['event'] = event
 
         # 5. 誘拐後
-        node.sleep_sim(cfg['post_event_sec'], during=self.keep_navigating)
+        node.sleep_sim(post_sec, during=self.keep_navigating)
         with node.lock:
             node.recording = False
             rows = list(node.rows)

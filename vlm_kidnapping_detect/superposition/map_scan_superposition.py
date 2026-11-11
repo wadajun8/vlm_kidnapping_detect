@@ -231,6 +231,9 @@ class RenderConfig:
     best_pose_radius: int = 4
     laser_point_radius: int = 1
     laser_color: BGRColor = COLOR_LASER
+    # 不透明度（0〜1）。1.0 で従来どおり上書き、1.0 未満で下の地図の色が透けて見える
+    laser_alpha: float = 1.0
+    particle_alpha: float = 1.0
 
 
 class OverlayRenderer:
@@ -281,11 +284,28 @@ class OverlayRenderer:
         if not np.any(valid):
             return
 
-        img[py_arr[valid], px_arr[valid]] = color
+        mask = np.zeros(img.shape[:2], dtype=bool)
+        mask[py_arr[valid], px_arr[valid]] = True
+        self._blend(img, mask, color, self.config.particle_alpha)
 
     def _draw_laser_points(self, img: np.ndarray, points: Sequence[Pixel], color: BGRColor) -> None:
+        if not points:
+            return
+        mask = np.zeros(img.shape[:2], dtype=np.uint8)
         for px, py in points:
-            cv2.circle(img, (px, py), self.config.laser_point_radius, color, -1)
+            cv2.circle(mask, (px, py), self.config.laser_point_radius, 255, -1)
+        self._blend(img, mask.astype(bool), color, self.config.laser_alpha)
+
+    @staticmethod
+    def _blend(img: np.ndarray, mask: np.ndarray, color: BGRColor, alpha: float) -> None:
+        """mask の画素を color で塗る。alpha < 1 なら下の色と混ぜる（アルファ合成）。
+        同じ画素に何度描いても1回分しか混ぜない（点が重なっても濃くならない）。"""
+        if alpha >= 1.0:
+            img[mask] = color
+            return
+        below = img[mask].astype(np.float32)
+        mixed = alpha * np.array(color, dtype=np.float32) + (1.0 - alpha) * below
+        img[mask] = np.clip(np.rint(mixed), 0, 255).astype(np.uint8)
 
     def _draw_best_pose(self, img: np.ndarray, pose: PosePixel, t: float) -> None:
         px, py, yaw = pose
@@ -386,6 +406,8 @@ class NodeParams:
     best_pose_radius: int = 4
     laser_point_radius: int = 1
     laser_point_color: List[int] = field(default_factory=lambda: list(COLOR_LASER))
+    laser_alpha: float = 1.0      # LiDAR点群の不透明度（0〜1）
+    particle_alpha: float = 1.0   # パーティクルの不透明度（0〜1）
     # 重畳画像との時刻差がこれ以下のカメラ画像だけを組にして保存する [秒]
     camera_sync_tolerance_sec: float = 0.2
 
@@ -404,6 +426,8 @@ class Superposition(Node):
             best_pose_radius=self.params.best_pose_radius,
             laser_point_radius=self.params.laser_point_radius,
             laser_color=self._laser_color(),
+            laser_alpha=self._alpha('laser_alpha'),
+            particle_alpha=self._alpha('particle_alpha'),
         ))
         self.saver = ImageSaver('/tmp')
         self.cv_bridge = CvBridge()
@@ -456,7 +480,9 @@ class Superposition(Node):
             f'snapshot_count={self.params.snapshot_count}, '
             f'show_particles={self.params.show_particles}, '
             f'show_laser_scan={self.params.show_laser_scan}, '
-            f'show_best_pose={self.params.show_best_pose})')
+            f'show_best_pose={self.params.show_best_pose}, '
+            f'laser_alpha={self.renderer.config.laser_alpha}, '
+            f'particle_alpha={self.renderer.config.particle_alpha})')
 
     # ------------------------------------------------------------------
     # 初期化
@@ -467,6 +493,14 @@ class Superposition(Node):
             self.declare_parameter(name, default)
         values = {name: self.get_parameter(name).value for name in vars(defaults)}
         return NodeParams(**values)
+
+    def _alpha(self, name: str) -> float:
+        """不透明度のパラメータを検証する。0より大きく1以下でなければ1.0（上書き）にする"""
+        value = float(getattr(self.params, name))
+        if 0.0 < value <= 1.0:
+            return value
+        self.get_logger().warn(f'{name}が不正です({value})。1.0（上書き）を使用します')
+        return 1.0
 
     def _laser_color(self) -> BGRColor:
         """laser_point_colorパラメータ(BGR)を検証してタプルへ変換する"""

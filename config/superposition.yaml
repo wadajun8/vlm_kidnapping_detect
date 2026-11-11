@@ -26,3 +26,7 @@ superposition_node:  # launch で付けているノード名と一致させる
     best_pose_radius: 4         # 自己位置マーカーの基準半径 [px]
     laser_point_radius: 1       # LiDAR点群の描画半径 [px]
     laser_point_color: [255, 0, 255]  # LiDAR点群の色（BGR順、各0〜255）
+    # 不透明度（0〜1）。1.0 で地図を上書き（2026/10/29 のデータセットはこれ）。
+    # 1.0 未満で地図の色が透ける：壁（黒）の上の点群は暗い紫、通れる空間（白）の上は薄いピンクになる
+    laser_alpha: 0.5
+    particle_alpha: 0.5

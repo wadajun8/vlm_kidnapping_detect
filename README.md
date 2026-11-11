@@ -131,6 +131,18 @@ ros2 run vlm_kidnapping_detect superposition \
 
 要素数が3でない、または0〜255の範囲外の値を含む場合は警告を出してデフォルト色に戻ります。
 
+### 半透明で描く（アルファ合成）
+
+`laser_alpha`・`particle_alpha`（0〜1）を 1.0 未満にすると、LiDAR点群とパーティクルを半透明で重ね、下の地図の色が透けて見えます。
+たとえば 0.5 では、点群が地図の壁（黒）に重なった部分は暗い紫、通れる空間（白）の上は薄いピンクになり、点群が壁を隠さなくなります。
+同じ画素に何度描いても1回分しか混ぜないので、点が重なっても濃くはなりません。1.0（ノードの既定値）は従来どおりの上書きです。
+
+```bash
+ros2 run vlm_kidnapping_detect superposition \
+  --ros-args \
+  -p laser_alpha:=0.5 -p particle_alpha:=0.5
+```
+
 **EMCL + パーティクル非表示の例:**
 
 ```bash
@@ -274,6 +286,8 @@ USBカメラ（V4L2）の画像を 10Hz で `/camera/color/image_raw`（bgr8）�
 | `best_pose_radius` | int | `4` | 自己位置マーカーの基準半径 [px] |
 | `laser_point_radius` | int | `1` | LiDAR点群の描画半径 [px] |
 | `laser_point_color` | int[] | `[255, 0, 255]` | LiDAR点群の描画色（**BGR順**、各0〜255） |
+| `laser_alpha` | double | `1.0` | LiDAR点群の不透明度（0〜1）。1.0 未満で下の地図の色が透ける（`config/superposition.yaml` では 0.5） |
+| `particle_alpha` | double | `1.0` | パーティクルの不透明度（0〜1）。同上（`config/superposition.yaml` では 0.5） |
 
 ### サービス
 

@@ -55,6 +55,7 @@ KEY_PARAMS = {
         'capture_interval_sec', 'snapshot_count', 'show_particles', 'show_laser_scan',
         'show_best_pose', 'best_pose_radius', 'laser_point_radius', 'laser_point_color',
         'particle_topic', 'particle_msg_type', 'camera_sync_tolerance_sec',
+        'laser_alpha', 'particle_alpha',
     ],
     'controller_server': [
         'controller_frequency', 'FollowPath.plugin', 'FollowPath.max_vel_x',
@@ -340,8 +341,11 @@ def collect_conditions(condition_dir: Path) -> Dict[str, Any]:
             'reset_settle_sec': cfg['reset_settle_sec'],
             'initialpose_settle_sec': cfg['initialpose_settle_sec'],
             'warmup_sec': cfg['warmup_sec'],
-            'pre_event_sec': cfg['pre_event_sec'],
-            'post_event_sec': cfg['post_event_sec'],
+            # 固定の長さ（2026/10/29）か、誘拐の時刻をランダムに選ぶ長いエピソード（連続判定用）のどちらか
+            'pre_event_sec': cfg.get('pre_event_sec'),
+            'post_event_sec': cfg.get('post_event_sec'),
+            'episode_sec': cfg.get('episode_sec'),
+            'event_time_sec': cfg.get('event_time_sec'),
             'reset_timeout_sec': cfg['reset_timeout_sec'],
             'start_and_goal_selection':
                 f'壁から {cfg["min_clearance_m"]} m 以上離れた自由空間から一様に選択。ゴールは現在地から '
@@ -360,6 +364,16 @@ def collect_conditions(condition_dir: Path) -> Dict[str, Any]:
 
 def fov_deg(rad: Optional[float]) -> Optional[float]:
     return None if rad is None else round(math.degrees(rad), 1)
+
+
+def event_rows(proc: Dict[str, Any]) -> List[List[Any]]:
+    """手順の表のうち、記録時間と誘拐の時刻の行"""
+    if proc.get('episode_sec') is not None and proc.get('event_time_sec') is not None:
+        lo, hi = proc['event_time_sec']
+        return [['1エピソードの記録', f'{proc["episode_sec"]} s'],
+                ['誘拐の時刻（記録開始から）', f'{lo}〜{hi} s から一様に選択（normal では何もしない）']]
+    return [['誘拐前の記録', f'{proc["pre_event_sec"]} s'],
+            ['誘拐後の記録', f'{proc["post_event_sec"]} s']]
 
 
 def conditions_markdown(c: Dict[str, Any]) -> str:
@@ -392,8 +406,7 @@ def conditions_markdown(c: Dict[str, Any]) -> str:
            md_table([
                ['エピソード数', proc['episodes']], ['乱数 seed', proc['seed']],
                ['ウォームアップ（保存しない）', f'{proc["warmup_sec"]} s'],
-               ['誘拐前の記録', f'{proc["pre_event_sec"]} s'],
-               ['誘拐後の記録', f'{proc["post_event_sec"]} s'],
+               *event_rows(proc),
                ['開始・ゴールの選び方', proc['start_and_goal_selection']],
                ['/initialpose の標準偏差',
                 f'{proc["initialpose_std"]["xy_m"]} m, {proc["initialpose_std"]["yaw_deg"]}°'],
